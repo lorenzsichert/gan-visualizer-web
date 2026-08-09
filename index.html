@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GAN Audio Visualizer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0b0d'/><rect x='3.5' y='3.5' width='9' height='9' fill='none' stroke='%23e9a13b' stroke-width='1.5'/></svg>" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <canvas id="view"></canvas>
+
+  <aside id="panel">
+    <div class="panel-header">
+      <h2>Controls</h2>
+      <button id="panel-toggle" class="icon-btn" title="Hide panel" aria-label="Hide panel">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9 7l5 5-5 5"/>
+          <path d="M16 7l5 5-5 5"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="panel-body" id="panel-body">
+      <section class="stats">
+        <div class="stat stat-status">
+          <span class="stat-label">Status</span>
+          <span id="status" class="stat-value">initializing&hellip;</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">FPS</span>
+          <span id="fps" class="stat-value">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Infer</span>
+          <span id="infer" class="stat-value">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Audio→GAN</span>
+          <span id="audio-lat" class="stat-value">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Threads</span>
+          <span id="threads" class="stat-value">--</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Audio</span>
+          <span id="audio" class="stat-value">off</span>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="btn-mic" class="btn primary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="2.5" width="6" height="11.5" rx="3"/>
+            <path d="M5.5 10.5a6.5 6.5 0 0 0 13 0"/>
+            <path d="M12 17v4.5"/>
+          </svg>
+          <span class="btn-label">Enable Microphone</span>
+        </button>
+        <button id="btn-demo" class="btn" title="Synthesize a fake audio signal when no mic is available">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 12h3l2-7 4 14 3-10 2 6 2-3h4"/>
+          </svg>
+          <span>Demo signal</span>
+        </button>
+        <button id="btn-fullscreen" class="btn" title="Go fullscreen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M8 3H3v5"/>
+            <path d="M16 3h5v5"/>
+            <path d="M8 21H3v-5"/>
+            <path d="M16 21h5v-5"/>
+          </svg>
+          <span>Fullscreen</span>
+        </button>
+        <button id="btn-brightness" class="btn" title="Re-sample latents to re-learn the brightness direction">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2.5v2.5"/>
+            <path d="M12 19v2.5"/>
+            <path d="M2.5 12H5"/>
+            <path d="M19 12h2.5"/>
+            <path d="M5.1 5.1l1.8 1.8"/>
+            <path d="M17.1 17.1l1.8 1.8"/>
+            <path d="M18.9 5.1l-1.8 1.8"/>
+            <path d="M6.9 17.1l-1.8 1.8"/>
+          </svg>
+          <span>Re-discover brightness</span>
+        </button>
+      </section>
+
+      <div id="sliders"></div>
+    </div>
+  </aside>
+
+  <button id="panel-open" class="icon-btn" title="Show panel" aria-label="Show panel">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M15 7l-5 5 5 5"/>
+      <path d="M8 7l-5 5 5 5"/>
+    </svg>
+  </button>
+
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>

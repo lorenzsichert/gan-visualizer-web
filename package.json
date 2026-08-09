@@ -1,0 +1,14 @@
+{
+  "name": "gan-audio-visualizer-web",
+  "version": "1.0.0",
+  "description": "Browser port of the Python Audio GAN Visualizer. Runs the StyleGAN EndToEndNetwork.onnx model via onnxruntime-web (WebAssembly).",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "deps": "node scripts/fetch-ort.mjs"
+  },
+  "devDependencies": {
+    "onnxruntime-web": "^1.26.0"
+  },
+  "license": "MIT"
+}

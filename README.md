@@ -64,7 +64,9 @@ Then open **http://localhost:8080** and click **Enable Microphone**.
   within 5% of the fastest, so extra cores stay free for rendering and audio.
   The chosen thread count is **cached in `localStorage`** and only recomputed
   when the hardware or model changes; append `?bench` to the URL to force a
-  fresh calibration.
+  fresh calibration. The **Threads dropdown** overrides it with a fixed count
+  (persisted, and re-loads the model since the thread pool is fixed at WASM
+  init).
 - All per-pixel work (float → RGBA, hue shift) happens in the **worker**, off
   the UI thread.
 - Rendering is a single **GPU-accelerated** `drawImage` of a 512×512 offscreen

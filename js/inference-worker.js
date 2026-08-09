@@ -188,7 +188,11 @@ function runBenchWorker(url, threads) {
   });
 }
 
-async function benchmarkThreads(url, cachedThreads = null, force = false) {
+async function benchmarkThreads(url, cachedThreads = null, force = false, override = null) {
+  if (Number.isInteger(override) && override >= 1) {
+    lastBench = { threads: override, results: null, manual: true };
+    return override;
+  }
   if (!force && Number.isInteger(cachedThreads) && cachedThreads >= 1) {
     lastBench = { threads: cachedThreads, results: null };
     return cachedThreads;
@@ -213,7 +217,7 @@ async function benchmarkThreads(url, cachedThreads = null, force = false) {
 async function init(msg) {
   const url = msg.url || '/models/EndToEndNetwork.onnx';
   modelUrl = url;
-  const threads = await benchmarkThreads(url, msg.cachedThreads, !!msg.forceBench);
+  const threads = await benchmarkThreads(url, msg.cachedThreads, !!msg.forceBench, msg.threads);
   ort.env.wasm.numThreads = threads;
   postMessage({ type: 'status', text: 'Loading model (14 MB)&hellip;' });
   session = await withLock(() =>

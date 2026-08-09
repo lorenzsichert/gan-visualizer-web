@@ -168,7 +168,7 @@ function renderResult(bytes, ms) {
       if (mirrorMode === 2) ctx.filter = `blur(${blurPx}px)`;
       ctx.drawImage(off, 0, 0, dw, dh);
       ctx.filter = 'none';
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+      ctx.fillStyle = mirrorMode === 2 ? 'rgba(0, 0, 0, 0.2)' : 'rgba(0, 0, 0, 0.0)';
       ctx.fillRect(0, 0, dw, dh);
       ctx.restore();
     };
@@ -458,11 +458,15 @@ function setupUI() {
   const btnMirror = document.getElementById('btn-mirror');
   const mirrorLabel = btnMirror.querySelector('span');
   const MIRROR_LABELS = ['Mirror', 'Mirror', 'Mirror + Blur'];
-  btnMirror.addEventListener('click', () => {
-    mirrorMode = (mirrorMode + 1) % 3;
+  const updateMirrorUI = () => {
     btnMirror.classList.toggle('active', mirrorMode !== 0);
     mirrorLabel.textContent = MIRROR_LABELS[mirrorMode];
+  };
+  btnMirror.addEventListener('click', () => {
+    mirrorMode = (mirrorMode + 1) % 3;
+    updateMirrorUI();
   });
+  updateMirrorUI();
 }
 
 // ---------------------------------------------------------------------------

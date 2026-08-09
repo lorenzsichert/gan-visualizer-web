@@ -56,6 +56,8 @@ function initLatentState(dim) {
 // ---------------------------------------------------------------------------
 const audio = new AudioPipeline();
 let demo = false;
+// 0 = off, 1 = mirror (sharp tiles), 2 = mirror + blurred side tiles.
+let mirrorMode = 0;
 
 function genDemoSpectrum(t, out) {
   const beat1 = 0.5 + 0.5 * Math.sin(t * 2.1);
@@ -141,12 +143,60 @@ function renderResult(bytes, ms) {
   const scale = Math.min(cw / W, ch / H);
   const dw = W * scale;
   const dh = H * scale;
+  const y = (ch - dh) / 2;
+  const x = (cw - dw) / 2;
 
   ctx.fillStyle = '#0a0b0d';
   ctx.fillRect(0, 0, cw, ch);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(off, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+  ctx.drawImage(off, x, y, dw, dh);
+
+  // Mirror mode: tile reflected copies of the image out past the fitted frame
+  // so a window that is wider (landscape) or taller (portrait) than the image
+  // is fully covered instead of showing letterbox bars. Tiles alternate
+  // orientation so the seams mirror seamlessly. In mode 2 the tiled panels are
+  // additionally blurred. (With `scale = min(...)` only one axis ever has
+  // spare room, so no corners need filling.)
+  if (mirrorMode > 0) {
+    const blurPx = Math.max(6, Math.round(dw / 40));
+    const drawTile = (tx, ty, flipX, flipY) => {
+      ctx.save();
+      ctx.translate(tx + (flipX ? dw : 0), ty + (flipY ? dh : 0));
+      if (flipX) ctx.scale(-1, 1);
+      if (flipY) ctx.scale(1, -1);
+      if (mirrorMode === 2) ctx.filter = `blur(${blurPx}px)`;
+      ctx.drawImage(off, 0, 0, dw, dh);
+      ctx.filter = 'none';
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+      ctx.fillRect(0, 0, dw, dh);
+      ctx.restore();
+    };
+    if (cw > dw) {
+      let mirrored = true;
+      for (let tx = x - dw; tx + dw > 0; tx -= dw) {
+        drawTile(tx, y, mirrored, false);
+        mirrored = !mirrored;
+      }
+      mirrored = true;
+      for (let tx = x + dw; tx < cw; tx += dw) {
+        drawTile(tx, y, mirrored, false);
+        mirrored = !mirrored;
+      }
+    }
+    if (ch > dh) {
+      let mirrored = true;
+      for (let ty = y - dh; ty + dh > 0; ty -= dh) {
+        drawTile(x, ty, false, mirrored);
+        mirrored = !mirrored;
+      }
+      mirrored = true;
+      for (let ty = y + dh; ty < ch; ty += dh) {
+        drawTile(x, ty, false, mirrored);
+        mirrored = !mirrored;
+      }
+    }
+  }
 
   // FPS + inference latency meters.
   fpsFrames++;
@@ -403,6 +453,15 @@ function setupUI() {
   document.getElementById('btn-fullscreen').addEventListener('click', () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.documentElement.requestFullscreen();
+  });
+
+  const btnMirror = document.getElementById('btn-mirror');
+  const mirrorLabel = btnMirror.querySelector('span');
+  const MIRROR_LABELS = ['Mirror', 'Mirror', 'Mirror + Blur'];
+  btnMirror.addEventListener('click', () => {
+    mirrorMode = (mirrorMode + 1) % 3;
+    btnMirror.classList.toggle('active', mirrorMode !== 0);
+    mirrorLabel.textContent = MIRROR_LABELS[mirrorMode];
   });
 }
 

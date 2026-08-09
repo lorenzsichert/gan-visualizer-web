@@ -42,6 +42,11 @@ Then open **http://localhost:8080** and click **Enable Microphone**.
 - **Every parameter slider** from the Python app (smoothing, weights, lowpass,
   pulse/motion, hue shift, tanh). `Smoothing Factor` and `Pulse Smooth` are
   exposed because they dominate the audio → latent latency.
+- **Mirror** — tiles horizontally-reflected copies of the image to the left and
+  right so a landscape (wide) window is fully covered instead of showing
+  letterbox bars. Tiles alternate orientation for seamless mirrored seams.
+  Clicking the button again additionally **blurs** the side tiles (a third click
+  turns mirroring off).
 - **Fullscreen** and an **FPS / inference-latency HUD**.
 
 ## Architecture (why it's fast)

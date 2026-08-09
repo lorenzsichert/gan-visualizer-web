@@ -23,7 +23,6 @@ const elFps = document.getElementById('fps');
 const elInfer = document.getElementById('infer');
 const elThreads = document.getElementById('threads');
 const elAudio = document.getElementById('audio');
-const elAudioLat = document.getElementById('audio-lat');
 
 // ---------------------------------------------------------------------------
 // Persistent latent state (mirrors GANVisualizer.__init__ / _resize_latent_state)
@@ -275,7 +274,6 @@ function loop(now) {
     window.__dbg.audioActive = audio.active;
     window.__dbg.demo = demo;
     window.__dbg.workletMsgs = audio.msgCount;
-    window.__dbg.audioAgeMs = audio.audioAgeMs;
   }
 
   // Meters once per half second.
@@ -286,17 +284,6 @@ function loop(now) {
       elInfer.textContent = `${(inferSum / inferCount).toFixed(1)}ms`;
       inferSum = 0;
       inferCount = 0;
-    }
-    // True audio -> GAN-input age (device input latency + worklet window +
-    // message transit + render-loop read). Only meaningful when the mic feeds
-    // the pipeline; demo/silence show the last value dimmed.
-    const age = audio.audioAgeMs;
-    if (age !== null) {
-      elAudioLat.textContent = `${Math.max(0, age).toFixed(0)}ms`;
-      elAudioLat.classList.toggle('on', audio.active);
-    } else {
-      elAudioLat.textContent = '--';
-      elAudioLat.classList.remove('on');
     }
     fpsFrames = 0;
     fpsWindow = now;
@@ -416,13 +403,6 @@ function setupUI() {
   document.getElementById('btn-fullscreen').addEventListener('click', () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.documentElement.requestFullscreen();
-  });
-
-  document.getElementById('btn-brightness').addEventListener('click', () => {
-    if (worker) {
-      worker.postMessage({ type: 'brightness', samples: 48 });
-      setStatus('discovering brightness...');
-    }
   });
 }
 

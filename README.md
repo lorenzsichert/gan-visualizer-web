@@ -42,7 +42,7 @@ Then open **http://localhost:8080** and click **Enable Microphone**.
 - **Every parameter slider** from the Python app (smoothing, weights, lowpass,
   pulse/motion, hue shift, tanh). `Smoothing Factor` and `Pulse Smooth` are
   exposed because they dominate the audio → latent latency.
-- **Fullscreen** and an **FPS / inference-latency / audio→GAN-latency HUD**.
+- **Fullscreen** and an **FPS / inference-latency HUD**.
 
 ## Architecture (why it's fast)
 
@@ -63,10 +63,6 @@ Then open **http://localhost:8080** and click **Enable Microphone**.
   synchronously) to avoid GC jank.
 - The mic `AudioContext` uses `latencyHint: 'interactive'` with all signal
   processing (echo cancellation, noise suppression, AGC) disabled.
-- The `Audio→GAN` HUD stat is the live age of the freshest spectrum's newest
-  sample measured against the audio clock — the real end-to-end latency from
-  "sound recorded" to "z handed to the generator" (input-device latency +
-  worklet window + message transit + 60 fps render-loop read).
 
 The Python app's 60 FPS timer is replaced by a decoupled "latest-wins" pipeline:
 the worker runs inference as fast as it can on the freshest latent, and every

@@ -275,7 +275,13 @@ button { font-family: inherit; }
   border-bottom: 1px solid var(--line);
 }
 
-.slider { margin-bottom: 14px; }
+.slider {
+  margin-bottom: 14px;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
 .slider:last-child { margin-bottom: 0; }
 
 .slider .label {
@@ -309,6 +315,7 @@ input[type="range"] {
   height: 14px;
   background: transparent;
   cursor: pointer;
+  touch-action: none;
 }
 
 input[type="range"]:focus { outline: none; }

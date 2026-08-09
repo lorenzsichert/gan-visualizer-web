@@ -11,6 +11,13 @@
  * Execution runs on multi-threaded **WASM** (single-threaded when
  * SharedArrayBuffer is unavailable).
  *
+ * Before the live session is created, the thread count is chosen by a short
+ * benchmark: one throwaway worker per candidate thread count measures median
+ * inference latency, and the FEWEST threads within tolerance of the fastest are
+ * used (sparing cores for the render loop and audio). The chosen thread count
+ * is cached by the main thread (localStorage) so the calibration only runs once
+ * per machine/model.
+ *
  * Brightness-direction discovery (port of main.py `_discover_brightness_*`)
  * runs here too so the UI never blocks. All `session.run` calls are serialized
  * through a promise lock so discovery and the live render loop never race.
@@ -22,10 +29,10 @@ const OUTPUT = 'img';
 const HAS_SAB = typeof SharedArrayBuffer !== 'undefined';
 
 ort.env.wasm.wasmPaths = '/lib/ort-wasm/';
-ort.env.wasm.numThreads = HAS_SAB
-  ? Math.min(8, Math.max(2, navigator.hardwareConcurrency || 4))
-  : 1;
 ort.env.logLevel = 'warning';
+// Default thread pool (only read when the WASM module first initializes); the
+// real value is set after the benchmark below picks the best thread count.
+ort.env.wasm.numThreads = defaultThreads();
 
 let session = null;
 let dim = 512;
@@ -109,9 +116,105 @@ function readDim(session) {
   return 512;
 }
 
+// ---------------------------------------------------------------------------
+// Thread-count benchmarking
+// ---------------------------------------------------------------------------
+// onnxruntime-web bakes `numThreads` into the WASM module at first init; the
+// pool can't be resized later in the same realm. So before the live session is
+// created we spawn one throwaway worker per candidate thread count (each a
+// fresh module, js/bench-worker.js) and time a warmed run. We then pick the
+// FEWEST threads whose median latency is within BENCH_TOLERANCE of the fastest:
+// the cores those extra threads would hog are better spent on the render loop
+// and audio worklet, and a few percent is imperceptible in the animation.
+const BENCH_RUNS = 8;
+const BENCH_WARMUP = 2;
+const BENCH_TOLERANCE = 1.05;
+const BENCH_TIMEOUT_MS = 60000;
+
+let lastBench = null;
+
+function defaultThreads() {
+  return HAS_SAB
+    ? Math.min(4, Math.max(2, navigator.hardwareConcurrency || 4))
+    : 1;
+}
+
+function candidateThreads() {
+  if (!HAS_SAB) return [1];
+  const hc = navigator.hardwareConcurrency || 4;
+  const set = new Set([1, hc]);
+  for (let t = 2; t <= hc; t *= 2) set.add(t);
+  return [...set].sort((a, b) => a - b);
+}
+
+function chooseThreads(results) {
+  const valid = results
+    .filter((r) => Number.isFinite(r.ms))
+    .sort((a, b) => a.threads - b.threads);
+  if (!valid.length) return defaultThreads();
+  let best = Infinity;
+  for (const r of valid) if (r.ms < best) best = r.ms;
+  for (const r of valid) if (r.ms <= best * BENCH_TOLERANCE) return r.threads;
+  return valid[0].threads;
+}
+
+function runBenchWorker(url, threads) {
+  return new Promise((resolve) => {
+    let w = null;
+    let timer = 0;
+    const done = (ms) => {
+      if (w) w.terminate();
+      clearTimeout(timer);
+      resolve(ms);
+    };
+    timer = setTimeout(() => done(Infinity), BENCH_TIMEOUT_MS);
+    try {
+      w = new Worker('/js/bench-worker.js', { type: 'module' });
+    } catch (err) {
+      done(Infinity);
+      return;
+    }
+    w.onmessage = (e) => {
+      if (e.data && e.data.type === 'result') done(e.data.ms);
+    };
+    w.onerror = () => done(Infinity);
+    w.postMessage({
+      type: 'bench',
+      url,
+      threads,
+      runs: BENCH_RUNS,
+      warmup: BENCH_WARMUP,
+    });
+  });
+}
+
+async function benchmarkThreads(url, cachedThreads = null, force = false) {
+  if (!force && Number.isInteger(cachedThreads) && cachedThreads >= 1) {
+    lastBench = { threads: cachedThreads, results: null };
+    return cachedThreads;
+  }
+
+  const candidates = candidateThreads();
+  const results = [];
+  postMessage({ type: 'status', text: 'Checking ONNX thread performance&hellip;' });
+  for (const threads of candidates) {
+    postMessage({
+      type: 'status',
+      text: `Benchmarking ${threads} thread${threads === 1 ? '' : 's'}&hellip;`,
+    });
+    results.push({ threads, ms: await runBenchWorker(url, threads) });
+  }
+
+  const chosen = chooseThreads(results);
+  lastBench = { threads: chosen, results };
+  return chosen;
+}
+
 async function init(msg) {
   const url = msg.url || '/models/EndToEndNetwork.onnx';
   modelUrl = url;
+  const threads = await benchmarkThreads(url, msg.cachedThreads, !!msg.forceBench);
+  ort.env.wasm.numThreads = threads;
   postMessage({ type: 'status', text: 'Loading model (14 MB)&hellip;' });
   session = await withLock(() =>
     ort.InferenceSession.create(url, {
@@ -125,6 +228,7 @@ async function init(msg) {
     dim,
     threads: ort.env.wasm.numThreads,
     multithreaded: HAS_SAB,
+    bench: lastBench,
   });
 }
 

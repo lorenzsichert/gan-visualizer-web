@@ -59,6 +59,12 @@ Then open **http://localhost:8080** and click **Enable Microphone**.
 
 - WASM runs **multi-threaded** (pthreads) thanks to the cross-origin-isolated
   server — all cores work on the 512×512 conv stack.
+- Before the live session starts, the inference worker **benchmarks the model
+  across several thread counts** and uses the *fewest* threads whose latency is
+  within 5% of the fastest, so extra cores stay free for rendering and audio.
+  The chosen thread count is **cached in `localStorage`** and only recomputed
+  when the hardware or model changes; append `?bench` to the URL to force a
+  fresh calibration.
 - All per-pixel work (float → RGBA, hue shift) happens in the **worker**, off
   the UI thread.
 - Rendering is a single **GPU-accelerated** `drawImage` of a 512×512 offscreen
@@ -85,7 +91,8 @@ js/main.js             render loop, latent math, UI
 js/lsd.js              LSDLatent port
 js/audio.js            microphone pipeline (main-thread side)
 js/settings.js         parameter definitions (port of midi.settings)
-js/inference-worker.js ORT WASM session + RGBA conversion + hue + brightness discovery
+js/inference-worker.js ORT WASM session + thread-count benchmark + RGBA conversion + hue + brightness discovery
+js/bench-worker.js    one-shot per-thread-count latency benchmark worker (spawned by the inference worker)
 worklets/audio-worklet.js  AudioWorklet FFT processor (sliding window)
 scripts/latency-test.mjs   node script: measures the audio -> GAN-input DSP latency
 scripts/bench-ort.mjs      node script: times a single WASM inference of the ONNX model

@@ -86,6 +86,26 @@ function genDemoSpectrum(t, out) {
 let worker = null;
 let ready = false;
 
+// Cached in localStorage so the thread-count benchmark only runs once per
+// machine/model; `?bench` in the URL forces a fresh calibration.
+const BENCH_KEY = 'bench-threads';
+
+function cachedThreads() {
+  try {
+    const data = JSON.parse(localStorage.getItem(BENCH_KEY) || 'null');
+    if (
+      Number.isInteger(data?.threads) &&
+      data.threads >= 1 &&
+      data.hw === (navigator.hardwareConcurrency || 0)
+    ) {
+      return data.threads;
+    }
+  } catch (err) {
+    /* Corrupt or unavailable storage — the worker will just re-benchmark. */
+  }
+  return null;
+}
+
 function initWorker() {
   worker = new Worker('/js/inference-worker.js', { type: 'module' });
   worker.onmessage = (e) => handleWorker(e.data);
@@ -93,7 +113,11 @@ function initWorker() {
     elStatus.textContent = 'worker error: ' + e.message;
     console.error(e);
   };
-  worker.postMessage({ type: 'init' });
+  worker.postMessage({
+    type: 'init',
+    cachedThreads: cachedThreads(),
+    forceBench: new URLSearchParams(location.search).has('bench'),
+  });
 }
 
 function handleWorker(msg) {
@@ -105,6 +129,15 @@ function handleWorker(msg) {
       elStatus.textContent = 'model ready';
       elThreads.textContent = msg.threads;
       elThreads.classList.add('on');
+      window.__dbg.bench = msg.bench;
+      try {
+        localStorage.setItem(
+          BENCH_KEY,
+          JSON.stringify({ threads: msg.threads, hw: navigator.hardwareConcurrency || 0 })
+        );
+      } catch (err) {
+        /* Non-fatal: we just re-benchmark next load. */
+      }
       // Background brightness-direction discovery (doesn't block rendering).
       worker.postMessage({ type: 'brightness', samples: 48 });
       break;
@@ -134,6 +167,14 @@ off.height = H;
 const offCtx = off.getContext('2d');
 const img = offCtx.createImageData(W, H);
 
+// Low-res blurred copy of the frame, pre-rendered once per frame when mirror
+// mode 2 is active. Blurring with ctx.filter is expensive on the main thread
+// (especially Safari), so it is computed once at a fraction of the resolution;
+// every tile just blits this small canvas scaled up, which looks identical for
+// a soft background and is a fraction of the cost.
+const blurTile = document.createElement('canvas');
+const blurTileCtx = blurTile.getContext('2d');
+
 function renderResult(bytes, ms) {
   img.data.set(bytes);
   offCtx.putImageData(img, 0, 0);
@@ -159,16 +200,29 @@ function renderResult(bytes, ms) {
   // additionally blurred. (With `scale = min(...)` only one axis ever has
   // spare room, so no corners need filling.)
   if (mirrorMode > 0) {
-    const blurPx = Math.max(6, Math.round(dw / 40));
+    const blurred = mirrorMode === 2;
+    let tileSource = off;
+    if (blurred) {
+      const blurPx = Math.max(6, Math.round(dw / 40));
+      const bw = Math.max(64, Math.round(dw / 4));
+      if (blurTile.width !== bw) {
+        blurTile.width = bw;
+        blurTile.height = bw;
+      }
+      blurTileCtx.clearRect(0, 0, bw, bw);
+      blurTileCtx.filter = `blur(${Math.max(2, Math.round((blurPx * bw) / dw))}px)`;
+      blurTileCtx.drawImage(off, 0, 0, bw, bw);
+      blurTileCtx.filter = 'none';
+      tileSource = blurTile;
+    }
     const drawTile = (tx, ty, flipX, flipY) => {
       ctx.save();
       ctx.translate(tx + (flipX ? dw : 0), ty + (flipY ? dh : 0));
       if (flipX) ctx.scale(-1, 1);
       if (flipY) ctx.scale(1, -1);
-      if (mirrorMode === 2) ctx.filter = `blur(${blurPx}px)`;
-      ctx.drawImage(off, 0, 0, dw, dh);
-      ctx.filter = 'none';
-      ctx.fillStyle = mirrorMode === 2 ? 'rgba(0, 0, 0, 0.2)' : 'rgba(0, 0, 0, 0.0)';
+      ctx.imageSmoothingQuality = 'low';
+      ctx.drawImage(tileSource, 0, 0, dw, dh);
+      ctx.fillStyle = blurred ? 'rgba(0, 0, 0, 0.2)' : 'rgba(0, 0, 0, 0.0)';
       ctx.fillRect(0, 0, dw, dh);
       ctx.restore();
     };

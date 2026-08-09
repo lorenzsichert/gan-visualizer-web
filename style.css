@@ -195,6 +195,23 @@ button { font-family: inherit; }
   text-overflow: ellipsis;
 }
 
+select.stat-value {
+  appearance: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888fa1' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    right 7px center / 10px 6px no-repeat;
+  padding: 3px 22px 3px 7px;
+  cursor: pointer;
+  max-width: 100%;
+}
+
+select.stat-value option {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
 .stat-value.on { color: var(--accent); }
 
 /* ---------- Actions ---------- */

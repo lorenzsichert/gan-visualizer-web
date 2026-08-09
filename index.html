@@ -37,7 +37,9 @@
         </div>
         <div class="stat">
           <span class="stat-label">Threads</span>
-          <span id="threads" class="stat-value">--</span>
+          <select id="threads" class="stat-value" title="WASM inference threads. Shows the current count; picking a value overrides the benchmarked best (the model reloads when changed).">
+            <option value="auto">Auto</option>
+          </select>
         </div>
         <div class="stat">
           <span class="stat-label">Audio</span>

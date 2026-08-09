@@ -85,10 +85,33 @@ function genDemoSpectrum(t, out) {
 // ---------------------------------------------------------------------------
 let worker = null;
 let ready = false;
+// null = auto (benchmarked); a number = the user's manual override, which skips
+// the benchmark on (re)start because the thread pool is baked into the WASM
+// module at init.
+let threadsOverride = loadThreadsOverride();
 
 // Cached in localStorage so the thread-count benchmark only runs once per
 // machine/model; `?bench` in the URL forces a fresh calibration.
 const BENCH_KEY = 'bench-threads';
+const OVERRIDE_KEY = 'threads-override';
+
+function threadOptions() {
+  if (typeof SharedArrayBuffer === 'undefined') return [1];
+  const hc = navigator.hardwareConcurrency || 4;
+  const set = new Set([1, hc]);
+  for (let t = 2; t <= hc; t *= 2) set.add(t);
+  return [...set].sort((a, b) => a - b);
+}
+
+function loadThreadsOverride() {
+  try {
+    const n = Number(localStorage.getItem(OVERRIDE_KEY));
+    if (Number.isInteger(n) && n >= 1) return n;
+  } catch (err) {
+    /* Corrupt or unavailable storage — fall back to auto. */
+  }
+  return null;
+}
 
 function cachedThreads() {
   try {
@@ -115,9 +138,42 @@ function initWorker() {
   };
   worker.postMessage({
     type: 'init',
-    cachedThreads: cachedThreads(),
+    threads: threadsOverride,
+    cachedThreads: threadsOverride == null ? cachedThreads() : null,
     forceBench: new URLSearchParams(location.search).has('bench'),
   });
+}
+
+// Manual thread-count selection: switch by spinning up a fresh worker (a new
+// WASM module) because onnxruntime-web bakes numThreads in at first init.
+function applyThreads(value) {
+  if (value === 'auto') {
+    threadsOverride = null;
+    try {
+      localStorage.removeItem(OVERRIDE_KEY);
+    } catch (err) {
+      /* non-fatal */
+    }
+  } else {
+    threadsOverride = Number(value);
+    try {
+      localStorage.setItem(OVERRIDE_KEY, String(threadsOverride));
+    } catch (err) {
+      /* non-fatal */
+    }
+  }
+  restartWorker();
+}
+
+function restartWorker() {
+  ready = false;
+  window.__dbg.ready = false;
+  if (worker) worker.terminate();
+  worker = null;
+  elThreads.classList.remove('on');
+  elThreads.disabled = true;
+  elStatus.textContent = 'restarting&hellip;';
+  initWorker();
 }
 
 function handleWorker(msg) {
@@ -127,9 +183,12 @@ function handleWorker(msg) {
       window.__dbg.ready = true;
       initLatentState(msg.dim || DIM);
       elStatus.textContent = 'model ready';
-      elThreads.textContent = msg.threads;
       elThreads.classList.add('on');
       window.__dbg.bench = msg.bench;
+      // Always show just the current thread count; Auto stays available as the
+      // first option if the user wants to revert to the benchmarked best.
+      elThreads.value = String(msg.threads);
+      elThreads.disabled = false;
       try {
         localStorage.setItem(
           BENCH_KEY,
@@ -462,6 +521,18 @@ window.addEventListener('resize', resize);
 function setupUI() {
   buildSliders();
   resize();
+
+  // Populate the thread dropdown: Auto (returns to the benchmarked best) plus
+  // bare-number options. The selected option always shows just the current
+  // thread count, even while Auto is in effect.
+  for (const t of threadOptions()) {
+    const opt = document.createElement('option');
+    opt.value = String(t);
+    opt.textContent = String(t);
+    elThreads.add(opt);
+  }
+  elThreads.disabled = true;
+  elThreads.addEventListener('change', () => applyThreads(elThreads.value));
 
   document.getElementById('panel-toggle').addEventListener('click', () => {
     document.getElementById('panel').classList.add('collapsed');

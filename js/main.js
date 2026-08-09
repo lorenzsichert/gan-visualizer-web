@@ -57,7 +57,7 @@ function initLatentState(dim) {
 const audio = new AudioPipeline();
 let demo = false;
 // 0 = off, 1 = mirror (sharp tiles), 2 = mirror + blurred side tiles.
-let mirrorMode = 0;
+let mirrorMode = 2;
 
 function genDemoSpectrum(t, out) {
   const beat1 = 0.5 + 0.5 * Math.sin(t * 2.1);

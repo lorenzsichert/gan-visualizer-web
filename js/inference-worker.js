@@ -63,7 +63,13 @@ let pumping = false;
 // results and the display age would grow without bound as FPS drops.
 let ackWaiter = null;
 
-// Serializes all session.run calls (single inference at a time).
+// Serializes ALL onnxruntime calls (session creation + session.run) into a
+// single in-flight operation. This is required, not just an optimization: the
+// JSEP (WebGPU/WebNN) WASM glue keeps one global "current call" slot and throws
+// "Session already started" / "Session mismatch" if two run calls — even on
+// different sessions — overlap. Discovery and live rendering therefore share
+// this lock and the same session; individual inferences still interleave at run
+// granularity, so the render loop keeps progressing during discovery.
 let lock = Promise.resolve();
 function withLock(fn) {
   const run = lock.then(fn, fn);
@@ -71,31 +77,11 @@ function withLock(fn) {
   return run;
 }
 
-// Brightness discovery runs on its OWN session and lock so its (potentially
-// many) inferences never queue behind — and never delay — live rendering.
 let modelUrl = '/models/EndToEndNetwork.onnx';
-let discoverySession = null;
-let discoveryLock = Promise.resolve();
-function withDiscoveryLock(fn) {
-  const run = discoveryLock.then(fn, fn);
-  discoveryLock = run.then(() => {}, () => {});
-  return run;
-}
 
-async function getDiscoverySession() {
-  if (discoverySession) return discoverySession;
-  discoverySession = await withDiscoveryLock(() =>
-    ort.InferenceSession.create(modelUrl, {
-      executionProviders: [activeProvider],
-      graphOptimizationLevel: 'all',
-    })
-  );
-  return discoverySession;
-}
-
-async function brightnessOfOn(sess, z) {
-  const result = await withDiscoveryLock(() =>
-    sess.run({ [INPUT]: new ort.Tensor('float32', z, [1, z.length]) })
+async function brightnessOfOn(z) {
+  const result = await withLock(() =>
+    session.run({ [INPUT]: new ort.Tensor('float32', z, [1, z.length]) })
   );
   const d = result[OUTPUT].data;
   let s = 0;
@@ -388,7 +374,6 @@ function hueShiftBytes(bytes, shift, WW, HH) {
 async function discoverBrightness(n = 48) {
   if (!session) return;
   postMessage({ type: 'status', text: 'Discovering brightness direction&hellip;' });
-  const dsession = await getDiscoverySession();
 
   const Z = new Float32Array(n * dim);
   for (let i = 0; i < Z.length; i++) {
@@ -405,7 +390,7 @@ async function discoverBrightness(n = 48) {
   const b = new Float32Array(n);
   const t0 = performance.now();
   for (let i = 0; i < n; i++) {
-    b[i] = await brightnessOfOn(dsession, Z.subarray(i * dim, (i + 1) * dim));
+    b[i] = await brightnessOfOn(Z.subarray(i * dim, (i + 1) * dim));
     if ((i + 1) % 8 === 0) {
       postMessage({ type: 'status', text: `Brightness ${i + 1}/${n}&hellip;` });
     }
@@ -434,10 +419,10 @@ async function discoverBrightness(n = 48) {
 
   // Sign: make +d point toward brighter images.
   if (norm > 1e-12) {
-    const pos = await brightnessOfOn(dsession, d);
+    const pos = await brightnessOfOn(d);
     const negArr = new Float32Array(dim);
     for (let j = 0; j < dim; j++) negArr[j] = -d[j];
-    const neg = await brightnessOfOn(dsession, negArr);
+    const neg = await brightnessOfOn(negArr);
     if (pos < neg) for (let j = 0; j < dim; j++) d[j] = -d[j];
   } else {
     d.fill(0);

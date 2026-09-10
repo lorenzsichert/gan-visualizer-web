@@ -1,5 +1,5 @@
 /**
- * Inference worker: owns the onnxruntime-web WASM session.
+ * Inference worker: owns the onnxruntime-web session.
  *
  * The main thread posts `{ type: 'z', z, tanh, hue }` messages (one per
  * animation frame) and this worker runs them "latest-wins": if a newer latent
@@ -8,31 +8,46 @@
  * here (the heaviest per-pixel loops), then transferred back so the main
  * thread only has to blit it to a canvas.
  *
- * Execution runs on multi-threaded **WASM** (single-threaded when
- * SharedArrayBuffer is unavailable).
- *
- * Before the live session is created, the thread count is chosen by a short
- * benchmark: one throwaway worker per candidate thread count measures median
- * inference latency, and the FEWEST threads within tolerance of the fastest are
- * used (sparing cores for the render loop and audio). The chosen thread count
- * is cached by the main thread (localStorage) so the calibration only runs once
+ * Before the live session is created, this worker CALIBRATES the compute
+ * backend: it benchmarks every available execution provider (`webgpu`, `webnn`,
+ * `wasm`, …) and, for WASM, every candidate thread count, then picks the
+ * fastest. Each candidate runs in a throwaway worker (js/bench-worker.js) so it
+ * gets a fresh module/realm. The chosen configuration is reported to the main
+ * thread, which caches it in localStorage, so the calibration only runs once
  * per machine/model.
+ *
+ * The onnxruntime-web build is chosen per provider: the small WASM-only module
+ * for `wasm`, and the full module for GPU providers. This keeps the large JSEP
+ * WASM binary off the wire for machines that stay on CPU.
  *
  * Brightness-direction discovery (port of main.py `_discover_brightness_*`)
  * runs here too so the UI never blocks. All `session.run` calls are serialized
  * through a promise lock so discovery and the live render loop never race.
  */
-import * as ort from '/lib/ort-wasm/ort.wasm.min.mjs';
-
 const INPUT = 'var';
 const OUTPUT = 'img';
 const HAS_SAB = typeof SharedArrayBuffer !== 'undefined';
 
-ort.env.wasm.wasmPaths = '/lib/ort-wasm/';
-ort.env.logLevel = 'warning';
-// Default thread pool (only read when the WASM module first initializes); the
-// real value is set after the benchmark below picks the best thread count.
-ort.env.wasm.numThreads = defaultThreads();
+// The active onnxruntime-web module (loaded lazily per provider) and the
+// provider it belongs to.
+let ort = null;
+let activeProvider = 'wasm';
+
+async function loadOrt(provider) {
+  if (ort && activeProvider === provider) return ort;
+  ort = await import(
+    provider === 'wasm'
+      ? '/lib/ort-wasm/ort.wasm.min.mjs'
+      : '/lib/ort-wasm/ort.all.min.mjs'
+  );
+  ort.env.wasm.wasmPaths = '/lib/ort-wasm/';
+  ort.env.logLevel = 'warning';
+  // Default thread pool (only read when the WASM module first initializes);
+  // the calibrated value is applied by init() below.
+  ort.env.wasm.numThreads = defaultThreads();
+  activeProvider = provider;
+  return ort;
+}
 
 let session = null;
 let dim = 512;
@@ -71,7 +86,7 @@ async function getDiscoverySession() {
   if (discoverySession) return discoverySession;
   discoverySession = await withDiscoveryLock(() =>
     ort.InferenceSession.create(modelUrl, {
-      executionProviders: ['wasm'],
+      executionProviders: [activeProvider],
       graphOptimizationLevel: 'all',
     })
   );
@@ -117,15 +132,22 @@ function readDim(session) {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-count benchmarking
+// Compute-provider benchmarking
 // ---------------------------------------------------------------------------
-// onnxruntime-web bakes `numThreads` into the WASM module at first init; the
-// pool can't be resized later in the same realm. So before the live session is
-// created we spawn one throwaway worker per candidate thread count (each a
-// fresh module, js/bench-worker.js) and time a warmed run. We then pick the
-// FEWEST threads whose median latency is within BENCH_TOLERANCE of the fastest:
-// the cores those extra threads would hog are better spent on the render loop
-// and audio worklet, and a few percent is imperceptible in the animation.
+// onnxruntime-web bakes `numThreads` into the WASM module at first init (the
+// pool can't be resized later in the same realm), and a session's execution
+// providers are fixed at creation. So before the live session is created we
+// spawn one throwaway worker per candidate configuration (each a fresh module,
+// js/bench-worker.js) and time a warmed run.
+//
+// Candidates are `{ provider, threads }`:
+//   - every provider the main thread detected (`webgpu`, `webnn`, `wasm`), once;
+//   - for WASM, every candidate thread count.
+//
+// Across providers we pick the fastest. Within WASM we pick the FEWEST threads
+// whose median latency is within BENCH_TOLERANCE of the fastest WASM run: the
+// cores those extra threads would hog are better spent on the render loop and
+// audio worklet, and a few percent is imperceptible in the animation.
 const BENCH_RUNS = 8;
 const BENCH_WARMUP = 2;
 const BENCH_TOLERANCE = 1.05;
@@ -147,18 +169,23 @@ function candidateThreads() {
   return [...set].sort((a, b) => a - b);
 }
 
-function chooseThreads(results) {
-  const valid = results
-    .filter((r) => Number.isFinite(r.ms))
-    .sort((a, b) => a.threads - b.threads);
-  if (!valid.length) return defaultThreads();
-  let best = Infinity;
-  for (const r of valid) if (r.ms < best) best = r.ms;
-  for (const r of valid) if (r.ms <= best * BENCH_TOLERANCE) return r.threads;
-  return valid[0].threads;
+function chooseConfig(results) {
+  const valid = results.filter((r) => Number.isFinite(r.ms));
+  if (!valid.length) return { provider: 'wasm', threads: defaultThreads() };
+  let best = valid[0];
+  for (const r of valid) if (r.ms < best.ms) best = r;
+  if (best.provider === 'wasm') {
+    const wasm = valid
+      .filter((r) => r.provider === 'wasm')
+      .sort((a, b) => a.threads - b.threads);
+    const fastest = Math.min(...wasm.map((r) => r.ms));
+    const pick = wasm.find((r) => r.ms <= fastest * BENCH_TOLERANCE);
+    return { provider: 'wasm', threads: pick ? pick.threads : best.threads };
+  }
+  return { provider: best.provider, threads: 1 };
 }
 
-function runBenchWorker(url, threads) {
+function runBenchWorker(url, provider, threads) {
   return new Promise((resolve) => {
     let w = null;
     let timer = 0;
@@ -181,6 +208,7 @@ function runBenchWorker(url, threads) {
     w.postMessage({
       type: 'bench',
       url,
+      provider,
       threads,
       runs: BENCH_RUNS,
       warmup: BENCH_WARMUP,
@@ -188,41 +216,68 @@ function runBenchWorker(url, threads) {
   });
 }
 
-async function benchmarkThreads(url, cachedThreads = null, force = false, override = null) {
-  if (Number.isInteger(override) && override >= 1) {
-    lastBench = { threads: override, results: null, manual: true };
-    return override;
-  }
-  if (!force && Number.isInteger(cachedThreads) && cachedThreads >= 1) {
-    lastBench = { threads: cachedThreads, results: null };
-    return cachedThreads;
-  }
-
-  const candidates = candidateThreads();
+async function benchmarkProviders(url, providers) {
   const results = [];
-  postMessage({ type: 'status', text: 'Checking ONNX thread performance&hellip;' });
-  for (const threads of candidates) {
-    postMessage({
-      type: 'status',
-      text: `Benchmarking ${threads} thread${threads === 1 ? '' : 's'}&hellip;`,
-    });
-    results.push({ threads, ms: await runBenchWorker(url, threads) });
+  postMessage({ type: 'status', text: 'Benchmarking compute providers&hellip;' });
+  for (const provider of providers) {
+    const candidates = provider === 'wasm' ? candidateThreads() : [1];
+    for (const threads of candidates) {
+      const label =
+        provider === 'wasm'
+          ? `wasm (${threads} thread${threads === 1 ? '' : 's'})`
+          : provider;
+      postMessage({ type: 'status', text: `Benchmarking ${label}&hellip;` });
+      const ms = await runBenchWorker(url, provider, threads);
+      const result = { provider, threads, ms };
+      results.push(result);
+      postMessage({ type: 'bench-result', ...result });
+    }
   }
-
-  const chosen = chooseThreads(results);
-  lastBench = { threads: chosen, results };
+  const chosen = chooseConfig(results);
+  lastBench = { provider: chosen.provider, threads: chosen.threads, results };
   return chosen;
+}
+
+function isValidConfig(config, providers) {
+  return (
+    config &&
+    typeof config.provider === 'string' &&
+    providers.includes(config.provider) &&
+    Number.isInteger(config.threads) &&
+    config.threads >= 1
+  );
 }
 
 async function init(msg) {
   const url = msg.url || '/models/EndToEndNetwork.onnx';
   modelUrl = url;
-  const threads = await benchmarkThreads(url, msg.cachedThreads, !!msg.forceBench, msg.threads);
-  ort.env.wasm.numThreads = threads;
+  const providers =
+    Array.isArray(msg.providers) && msg.providers.length ? msg.providers : ['wasm'];
+
+  let config;
+  if (typeof msg.providerOverride === 'string' && msg.providerOverride) {
+    config = {
+      provider: msg.providerOverride,
+      threads: Number.isInteger(msg.threads) && msg.threads >= 1 ? msg.threads : defaultThreads(),
+    };
+    lastBench = { ...config, results: null, manual: true };
+  } else if (Number.isInteger(msg.threads) && msg.threads >= 1) {
+    config = { provider: 'wasm', threads: msg.threads };
+    lastBench = { ...config, results: null, manual: true };
+  } else if (!msg.forceBench && isValidConfig(msg.cachedConfig, providers)) {
+    config = { provider: msg.cachedConfig.provider, threads: msg.cachedConfig.threads };
+    lastBench = { ...config, results: null, cached: true };
+  } else {
+    config = await benchmarkProviders(url, providers);
+  }
+
+  await loadOrt(config.provider);
+  if (config.provider === 'wasm') ort.env.wasm.numThreads = config.threads;
+
   postMessage({ type: 'status', text: 'Loading model (14 MB)&hellip;' });
   session = await withLock(() =>
     ort.InferenceSession.create(url, {
-      executionProviders: ['wasm'],
+      executionProviders: [config.provider],
       graphOptimizationLevel: 'all',
     })
   );
@@ -230,7 +285,8 @@ async function init(msg) {
   postMessage({
     type: 'ready',
     dim,
-    threads: ort.env.wasm.numThreads,
+    provider: config.provider,
+    threads: config.provider === 'wasm' ? ort.env.wasm.numThreads : 0,
     multithreaded: HAS_SAB,
     bench: lastBench,
   });

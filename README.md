@@ -2,8 +2,10 @@
 
 A browser port of the Python Qt app in the repo root. It runs the **StyleGAN
 end-to-end ONNX model** (`EndToEndNetwork.onnx`) in the browser using
-**onnxruntime-web (WebAssembly)**, drives it from your **microphone**, and
-renders the generated frames to a canvas.
+**onnxruntime-web**, drives it from your **microphone**, and renders the
+generated frames to a canvas. On startup it **benchmarks every available
+execution provider** (WebGPU, WebNN, WASM) and thread count, shows you how each
+one did, and automatically uses the fastest — then remembers the choice.
 
 Everything you need lives in this `web/` folder.
 
@@ -26,6 +28,13 @@ Then open **http://localhost:8080** and click **Enable Microphone**.
 
 ## Features
 
+- **Automatic compute calibration** — on first load (and whenever the hardware
+  or `?bench` changes) the inference worker benchmarks **WebGPU**, **WebNN** and
+  **WASM** (at several thread counts) in throwaway workers, shows a toast with
+  each provider's median inference latency, and selects the fastest. The winning
+  configuration is cached in `localStorage`, so later loads skip the benchmark
+  entirely. The **Compute** dropdown lets you override the pick; the **Threads**
+  dropdown overrides the WASM thread count.
 - **Microphone input** — `getUserMedia` → `AudioWorklet`, which computes the
   Hann-windowed 512-point FFT (256+1 bins) **off the main thread**, exactly
   mirroring the Python `recording.get_sample` pipeline. The FFT runs on a
@@ -55,18 +64,22 @@ Then open **http://localhost:8080** and click **Enable Microphone**.
 |---|---|
 | **Main** | render loop (`requestAnimationFrame`), latent math, one GPU `drawImage` blit |
 | **Audio worklet** | Hann window + FFT, posts the 257-bin spectrum (~344 Hz) |
-| **Inference worker** | owns the ORT WASM session; latest-wins queue; converts CHW→RGBA, applies the hue roll, and transfers the frame buffer |
+| **Inference worker** | owns the ORT session; latest-wins queue; converts CHW→RGBA, applies the hue roll, and transfers the frame buffer |
+| **Bench workers** | one throwaway worker per candidate `{provider, threads}` during calibration |
 
 - WASM runs **multi-threaded** (pthreads) thanks to the cross-origin-isolated
-  server — all cores work on the 512×512 conv stack.
-- Before the live session starts, the inference worker **benchmarks the model
-  across several thread counts** and uses the *fewest* threads whose latency is
-  within 5% of the fastest, so extra cores stay free for rendering and audio.
-  The chosen thread count is **cached in `localStorage`** and only recomputed
-  when the hardware or model changes; append `?bench` to the URL to force a
-  fresh calibration. The **Threads dropdown** overrides it with a fixed count
-  (persisted, and re-loads the model since the thread pool is fixed at WASM
-  init).
+  server — all cores work on the 512×512 conv stack. WebGPU/WebNN offload it to
+  the GPU where available.
+- Before the live session starts, the inference worker **benchmarks every
+  execution provider the browser exposes** (`webgpu`, `webnn`, `wasm`) plus
+  several WASM thread counts, each in a fresh worker realm, and picks the
+  fastest. Within WASM it uses the *fewest* threads whose latency is within 5%
+  of the fastest, so extra cores stay free for rendering and audio. The chosen
+  configuration is **cached in `localStorage`** and only recomputed when the
+  hardware, browser providers, or model change; append `?bench` to the URL to
+  force a fresh calibration. The **Compute dropdown** overrides the provider and
+  the **Threads dropdown** overrides the WASM thread count (both persisted; the
+  model reloads because the provider and thread pool are fixed at init).
 - All per-pixel work (float → RGBA, hue shift) happens in the **worker**, off
   the UI thread.
 - Rendering is a single **GPU-accelerated** `drawImage` of a 512×512 offscreen
@@ -87,14 +100,14 @@ completed frame is drawn immediately.
 index.html             page + control panel markup
 style.css              dark neon theme
 server.js              static server with cross-origin isolation headers
-lib/ort-wasm/          self-hosted onnxruntime-web WASM runtime (no CDN)
+lib/ort-wasm/          self-hosted onnxruntime-web runtimes (WASM-only + full, no CDN)
 models/                EndToEndNetwork.onnx (embedded, ~14 MB)
-js/main.js             render loop, latent math, UI
+js/main.js             render loop, latent math, UI, provider detection + config cache
 js/lsd.js              LSDLatent port
 js/audio.js            microphone pipeline (main-thread side)
 js/settings.js         parameter definitions (port of midi.settings)
-js/inference-worker.js ORT WASM session + thread-count benchmark + RGBA conversion + hue + brightness discovery
-js/bench-worker.js    one-shot per-thread-count latency benchmark worker (spawned by the inference worker)
+js/inference-worker.js ORT session + provider/thread calibration + RGBA conversion + hue + brightness discovery
+js/bench-worker.js    one-shot latency benchmark worker for a {provider, threads} candidate (spawned by the inference worker)
 worklets/audio-worklet.js  AudioWorklet FFT processor (sliding window)
 scripts/latency-test.mjs   node script: measures the audio -> GAN-input DSP latency
 scripts/bench-ort.mjs      node script: times a single WASM inference of the ONNX model

@@ -16,6 +16,7 @@ const SRC = join(ROOT, 'node_modules', 'onnxruntime-web', 'dist');
 const DST = join(ROOT, 'lib', 'ort-wasm');
 
 const FILES = [
+  // WASM-only runtime: used for the CPU ("wasm") execution provider.
   'ort-wasm-simd-threaded.mjs',
   'ort-wasm-simd-threaded.wasm',
   'ort.wasm.min.js',
@@ -23,6 +24,11 @@ const FILES = [
   'ort.wasm.min.mjs.map',
   'ort.wasm.js',
   'ort.wasm.mjs',
+  // Full runtime (wasm + WebGPU + WebNN + WebGL). The `all` bundle loads the
+  // JSEP WASM glue/binary, which is what exposes WebGPU and WebNN.
+  'ort.all.min.mjs',
+  'ort-wasm-simd-threaded.jsep.mjs',
+  'ort-wasm-simd-threaded.jsep.wasm',
 ];
 
 await mkdir(DST, { recursive: true });

@@ -146,10 +146,29 @@ button { font-family: inherit; }
 }
 .panel-body::-webkit-scrollbar-track { background: transparent; }
 
+/* ---------- Spectrum ---------- */
+.viz {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.viz canvas {
+  display: block;
+  width: 100%;
+  height: 110px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.viz canvas:active { cursor: grabbing; }
+
 /* ---------- Telemetry ---------- */
 .stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 1px;
   background: var(--line);
   border: 1px solid var(--line);
@@ -381,6 +400,93 @@ input[type="range"]::-moz-range-thumb:hover { background: var(--accent); }
 input[type="range"]:focus-visible::-webkit-slider-thumb {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
+}
+
+/* ---------- Compute benchmark toast ---------- */
+.toast {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 40;
+  min-width: 210px;
+  max-width: 280px;
+  padding: 12px 14px;
+  background: rgba(18, 19, 22, 0.94);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+  animation: toast-in 0.18s ease;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.toast-title {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 9px;
+}
+
+.toast-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bench-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  border-left: 2px solid transparent;
+}
+
+.bench-row .bench-name {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.bench-row .bench-ms {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.bench-row.failed .bench-name,
+.bench-row.failed .bench-ms {
+  color: var(--text-faint);
+}
+
+.bench-row.selected {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.bench-row.selected .bench-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.bench-row.selected .bench-ms {
+  color: var(--accent);
+}
+
+.toast-note {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 /* ---------- Focus ---------- */

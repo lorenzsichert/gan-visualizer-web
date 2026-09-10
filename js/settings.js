@@ -6,9 +6,15 @@
  * unchanged; entries marked `hidden: true` are simply not shown as sliders.
  */
 export const SETTINGS = {
-  "Pulse React":        { group: "Pulse",     value: 0.01, min: 0,    max: 0.1,    step: 0.001, dec: 2 },
-  "Brightness React":   { group: "Pulse",     value: 0.04, min: 0,    max: 0.5,    step: 0.001, dec: 2 },
+  "Pulse React":        { group: "Pulse",     value: 0.01, min: 0,    max: 1.5,    step: 0.001, dec: 2 },
+  "Pulse Freq":         { group: "Pulse",     value: 400,  min: 50,   max: 16000,  step: 5,     dec: 0 },
+  "Pulse Width":        { group: "Pulse",     value: 2.0,  min: 0.25, max: 4,      step: 0.01,  dec: 2 },
+  "Brightness React":   { group: "Pulse",     value: 0.04, min: 0,    max: 1.5,    step: 0.001, dec: 2 },
+  "Brightness Freq":    { group: "Pulse",     value: 800,  min: 50,   max: 16000,  step: 5,     dec: 0 },
+  "Brightness Width":   { group: "Pulse",     value: 1.0,  min: 0.25, max: 4,      step: 0.01,  dec: 2 },
   "Motion React":       { group: "Motion",    value: 0.01, min: 0,    max: 0.5,    step: 0.001, dec: 2 },
+  "Motion Freq":        { group: "Motion",    value: 600,  min: 50,   max: 16000,  step: 5,     dec: 0 },
+  "Motion Width":       { group: "Motion",    value: 2.0,  min: 0.25, max: 4,      step: 0.01,  dec: 2 },
   "Pulse Smooth":       { group: "Pulse",     value: 0.88,  min: 0,    max: 1,    step: 0.01, dec: 2, hidden: true },
   "Hue Shift":          { group: "Post",      value: 0.45, min: 0,    max: 5.0, step: 0.01, dec: 2 },
   "Motion Power":       { group: "Motion",    value: 1.39, min: 1.0,  max: 2.0, step: 0.01, dec: 2, hidden: true },

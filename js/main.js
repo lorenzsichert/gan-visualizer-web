@@ -10,6 +10,7 @@
 import { SETTINGS, GROUP_ORDER, get } from './settings.js';
 import { LSDLatent, randn } from './lsd.js';
 import { AudioPipeline } from './audio.js';
+import { SpectrumView, aWeightDb } from './spectrum.js';
 
 const W = 512;    // model output width
 const H = 512;    // model output height
@@ -22,7 +23,11 @@ const elStatus = document.getElementById('status');
 const elFps = document.getElementById('fps');
 const elInfer = document.getElementById('infer');
 const elThreads = document.getElementById('threads');
+const elProvider = document.getElementById('provider');
 const elAudio = document.getElementById('audio');
+const elToast = document.getElementById('bench-toast');
+const elToastRows = document.getElementById('bench-rows');
+const elToastNote = document.getElementById('bench-note');
 
 // ---------------------------------------------------------------------------
 // Persistent latent state (mirrors GANVisualizer.__init__ / _resize_latent_state)
@@ -40,6 +45,12 @@ let brightnessDir = null;
 let lastHueFlux = 0;
 let audioRandTimer = 0;
 
+// Per-bin A-weighting gain for the latent/LSD path, cached per sample rate
+// (mirrors the panel display's perceptual weighting). The raw `spectrum` fed
+// to SpectrumView is untouched so it isn't weighted twice.
+let aWeightGain = null;
+let aWeightSR = 0;
+
 // Rebuild per-dimension state (called on model ready).
 function initLatentState(dim) {
   DIM = dim;
@@ -55,9 +66,22 @@ function initLatentState(dim) {
 // Audio
 // ---------------------------------------------------------------------------
 const audio = new AudioPipeline();
+const spectrumView = new SpectrumView(document.getElementById('spectrum'));
 let demo = false;
 // 0 = off, 1 = mirror (sharp tiles), 2 = mirror + blurred side tiles.
 let mirrorMode = 2;
+
+// A source's display filter for the spectrum view: its center frequency, band
+// width, and react amount (plus the react range so the bell can be normalized).
+function filterInfo(freqKey, widthKey, reactKey) {
+  return {
+    freq: get(freqKey),
+    width: get(widthKey),
+    react: get(reactKey),
+    reactMin: SETTINGS[reactKey].min,
+    reactMax: SETTINGS[reactKey].max,
+  };
+}
 
 function genDemoSpectrum(t, out) {
   const beat1 = 0.5 + 0.5 * Math.sin(t * 2.1);
@@ -85,15 +109,31 @@ function genDemoSpectrum(t, out) {
 // ---------------------------------------------------------------------------
 let worker = null;
 let ready = false;
-// null = auto (benchmarked); a number = the user's manual override, which skips
-// the benchmark on (re)start because the thread pool is baked into the WASM
-// module at init.
-let threadsOverride = loadThreadsOverride();
 
-// Cached in localStorage so the thread-count benchmark only runs once per
-// machine/model; `?bench` in the URL forces a fresh calibration.
-const BENCH_KEY = 'bench-threads';
+// The auto-calibrated compute config is cached so the provider/thread benchmark
+// only runs once per machine/model; `?bench` in the URL forces a fresh one.
+const CONFIG_KEY = 'compute-config';
 const OVERRIDE_KEY = 'threads-override';
+const PROVIDER_KEY = 'provider-override';
+
+// null = auto (benchmarked); a number = the user's manual WASM thread override,
+// which skips the benchmark on (re)start because the thread pool is baked into
+// the WASM module at init.
+let threadsOverride = loadThreadsOverride();
+// null = auto (benchmarked); a string = the user's manual execution-provider
+// override (e.g. "webgpu").
+let providerOverride = loadProviderOverride();
+
+// Which execution providers this browser exposes. Detection runs on the window
+// (not inside the worker) so WebGPU/WebNN presence is reliable; the worker still
+// verifies each one by actually running it and times out anything that fails.
+function detectProviders() {
+  const list = [];
+  if (typeof navigator !== 'undefined' && navigator.gpu) list.push('webgpu');
+  if (typeof navigator !== 'undefined' && navigator.ml) list.push('webnn');
+  list.push('wasm');
+  return list;
+}
 
 function threadOptions() {
   if (typeof SharedArrayBuffer === 'undefined') return [1];
@@ -113,15 +153,27 @@ function loadThreadsOverride() {
   return null;
 }
 
-function cachedThreads() {
+function loadProviderOverride() {
   try {
-    const data = JSON.parse(localStorage.getItem(BENCH_KEY) || 'null');
+    const p = localStorage.getItem(PROVIDER_KEY);
+    if (p && detectProviders().includes(p)) return p;
+  } catch (err) {
+    /* Corrupt or unavailable storage — fall back to auto. */
+  }
+  return null;
+}
+
+function cachedConfig() {
+  try {
+    const data = JSON.parse(localStorage.getItem(CONFIG_KEY) || 'null');
     if (
-      Number.isInteger(data?.threads) &&
+      data &&
+      detectProviders().includes(data.provider) &&
+      Number.isInteger(data.threads) &&
       data.threads >= 1 &&
       data.hw === (navigator.hardwareConcurrency || 0)
     ) {
-      return data.threads;
+      return { provider: data.provider, threads: data.threads };
     }
   } catch (err) {
     /* Corrupt or unavailable storage — the worker will just re-benchmark. */
@@ -138,8 +190,11 @@ function initWorker() {
   };
   worker.postMessage({
     type: 'init',
+    providers: detectProviders(),
     threads: threadsOverride,
-    cachedThreads: threadsOverride == null ? cachedThreads() : null,
+    providerOverride,
+    cachedConfig:
+      threadsOverride == null && providerOverride == null ? cachedConfig() : null,
     forceBench: new URLSearchParams(location.search).has('bench'),
   });
 }
@@ -156,8 +211,35 @@ function applyThreads(value) {
     }
   } else {
     threadsOverride = Number(value);
+    // A thread count only means something for WASM, so it wins over any
+    // provider override.
+    providerOverride = null;
     try {
       localStorage.setItem(OVERRIDE_KEY, String(threadsOverride));
+      localStorage.removeItem(PROVIDER_KEY);
+    } catch (err) {
+      /* non-fatal */
+    }
+  }
+  restartWorker();
+}
+
+// Manual provider selection: restart with the chosen execution provider. Picking
+// a GPU provider drops any WASM thread override (which only applies to `wasm`).
+function applyProvider(value) {
+  if (value === 'auto') {
+    providerOverride = null;
+    try {
+      localStorage.removeItem(PROVIDER_KEY);
+    } catch (err) {
+      /* non-fatal */
+    }
+  } else {
+    providerOverride = value;
+    if (value !== 'wasm') threadsOverride = null;
+    try {
+      localStorage.setItem(PROVIDER_KEY, value);
+      if (value !== 'wasm') localStorage.removeItem(OVERRIDE_KEY);
     } catch (err) {
       /* non-fatal */
     }
@@ -172,8 +254,68 @@ function restartWorker() {
   worker = null;
   elThreads.classList.remove('on');
   elThreads.disabled = true;
+  elProvider.classList.remove('on');
+  elProvider.disabled = true;
   elStatus.textContent = 'restarting&hellip;';
   initWorker();
+}
+
+// ---------------------------------------------------------------------------
+// Compute-benchmark notification
+// ---------------------------------------------------------------------------
+let toastTimer = 0;
+
+function providerLabel(provider, threads) {
+  return provider === 'wasm' ? `wasm · ${threads}t` : provider;
+}
+
+function showBenchToast() {
+  elToast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideBenchToast, 10000);
+}
+
+function hideBenchToast() {
+  clearTimeout(toastTimer);
+  elToast.hidden = true;
+}
+
+// Add/update the live timing row for one benchmarked candidate.
+function addBenchRow(provider, threads, ms) {
+  const key = `${provider}:${threads}`;
+  let row = elToastRows.querySelector(`[data-key="${key}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'bench-row';
+    row.dataset.key = key;
+    const name = document.createElement('span');
+    name.className = 'bench-name';
+    name.textContent = providerLabel(provider, threads);
+    const time = document.createElement('span');
+    time.className = 'bench-ms';
+    row.append(name, time);
+    elToastRows.appendChild(row);
+  }
+  row.querySelector('.bench-ms').textContent = Number.isFinite(ms)
+    ? `${ms.toFixed(1)} ms`
+    : 'unavailable';
+  row.classList.toggle('failed', !Number.isFinite(ms));
+  showBenchToast();
+}
+
+// Highlight the winning row and show the summary once the worker is ready.
+function finishBenchToast(msg) {
+  const bench = msg.bench;
+  if (!bench || !bench.results) return;
+  const chosenKey = `${bench.provider}:${bench.threads}`;
+  for (const row of elToastRows.children) {
+    row.classList.toggle('selected', row.dataset.key === chosenKey);
+  }
+  elToastNote.textContent =
+    msg.provider === 'wasm'
+      ? `Selected wasm · ${bench.threads} thread${bench.threads === 1 ? '' : 's'}`
+      : `Selected ${msg.provider}`;
+  showBenchToast();
 }
 
 function handleWorker(msg) {
@@ -183,26 +325,44 @@ function handleWorker(msg) {
       window.__dbg.ready = true;
       initLatentState(msg.dim || DIM);
       elStatus.textContent = 'model ready';
-      elThreads.classList.add('on');
       window.__dbg.bench = msg.bench;
-      // Always show just the current thread count; Auto stays available as the
-      // first option if the user wants to revert to the benchmarked best.
-      elThreads.value = String(msg.threads);
-      elThreads.disabled = false;
-      try {
-        localStorage.setItem(
-          BENCH_KEY,
-          JSON.stringify({ threads: msg.threads, hw: navigator.hardwareConcurrency || 0 })
-        );
-      } catch (err) {
-        /* Non-fatal: we just re-benchmark next load. */
+      // The threads dropdown only applies to the WASM provider; show the
+      // calibrated provider in its own dropdown.
+      const isWasm = msg.provider === 'wasm';
+      elThreads.classList.toggle('on', isWasm);
+      elThreads.disabled = !isWasm;
+      if (isWasm && msg.threads >= 1) elThreads.value = String(msg.threads);
+      if (msg.provider) {
+        elProvider.value = msg.provider;
+        elProvider.classList.add('on');
+        elProvider.disabled = false;
       }
+      // Persist the auto-calibrated config (never a manual override) so the
+      // next load can skip the benchmark entirely.
+      if (msg.bench && !msg.bench.manual && msg.bench.results) {
+        try {
+          localStorage.setItem(
+            CONFIG_KEY,
+            JSON.stringify({
+              provider: msg.bench.provider,
+              threads: msg.bench.threads,
+              hw: navigator.hardwareConcurrency || 0,
+            })
+          );
+        } catch (err) {
+          /* Non-fatal: we just re-benchmark next load. */
+        }
+      }
+      finishBenchToast(msg);
       // Background brightness-direction discovery (doesn't block rendering).
       worker.postMessage({ type: 'brightness', samples: 48 });
       break;
     }
     case 'status':
       elStatus.innerHTML = msg.text;
+      break;
+    case 'bench-result':
+      addBenchRow(msg.provider, msg.threads, msg.ms);
       break;
     case 'result':
       renderResult(msg.bytes, msg.ms);
@@ -331,11 +491,24 @@ function computeLatent(dt, nowSec) {
     spectrum.fill(0);
   }
 
+  // --- A-weighting (perceptual loudness, same curve as the panel display) ---
+  // The raw magnitude spectrum is the panel; the latent/LSD path uses this
+  // A-weighted version so levels follow human loudness perception. Gain is
+  // cached per sample rate; bin i's frequency is i * sr / 512 (fftSize).
+  const sr = audio.lastSampleRate || 48000;
+  if (!aWeightGain || aWeightSR !== sr) {
+    if (!aWeightGain) aWeightGain = new Float32Array(BINS);
+    for (let i = 0; i < BINS; i++) {
+      aWeightGain[i] = Math.pow(10, aWeightDb((i * sr) / 512) / 20);
+    }
+    aWeightSR = sr;
+  }
+
   // --- Smoothing ---
   const smoothingFactor = get('Smoothing Factor');
   const smoothing = 1 - Math.exp((-dt * 10) / Math.max(smoothingFactor, 1e-6));
   for (let i = 0; i < BINS; i++) {
-    smoothed[i] = smoothing * smoothed[i] + (1 - smoothing) * spectrum[i];
+    smoothed[i] = smoothing * smoothed[i] + (1 - smoothing) * spectrum[i] * aWeightGain[i];
   }
 
   // --- Randomize Latent Vector (swap two lookup entries periodically) ---
@@ -355,21 +528,46 @@ function computeLatent(dt, nowSec) {
   }
 
   // --- Flux / low-pass measures ---
-  let lowPassNormal = 0;
-  for (let i = 0; i < BINS; i++) if (smoothed[i] > lowPassNormal) lowPassNormal = smoothed[i];
-  lowPassNormal = Math.max(lowPassNormal, 0);
+  // Brightness, pulse and motion each respond through a Gaussian band filter in
+  // log-frequency space (draggable on the spectrum for brightness): they react
+  // only around their center frequency, decaying smoothly to both sides.
+  const bfFreq = Math.max(get('Brightness Freq'), 1);
+  const bfWidth = Math.max(get('Brightness Width'), 0.05);
+  const bfNorm = 1 / (2 * bfWidth * bfWidth);
+  const pfFreq = Math.max(get('Pulse Freq'), 1);
+  const pfWidth = Math.max(get('Pulse Width'), 0.05);
+  const pfNorm = 1 / (2 * pfWidth * pfWidth);
+  const mfFreq = Math.max(get('Motion Freq'), 1);
+  const mfWidth = Math.max(get('Motion Width'), 0.05);
+  const mfNorm = 1 / (2 * mfWidth * mfWidth);
+
+  let pulseAmp = 0;
+  let lowPassBright = 0;
+  for (let i = 1; i < BINS; i++) {
+    const d = Math.log2((i * sr) / (512 * bfFreq));
+    const v = smoothed[i] * Math.exp(-d * d * bfNorm);
+    if (v > lowPassBright) lowPassBright = v;
+    const dp = Math.log2((i * sr) / (512 * pfFreq));
+    const vp = smoothed[i] * Math.exp(-dp * dp * pfNorm);
+    if (vp > pulseAmp) pulseAmp = vp;
+  }
 
   const invDt = 1 / Math.max(dt, 1e-6);
   let lowPassDrift = 0;
+  let motionAmp = 0;
   for (let i = 0; i < BINS; i++) {
     const f = (spectrum[i] - prevSpectrum[i]) * invDt;
     if (f > lowPassDrift) lowPassDrift = f;
+    const dm = Math.log2((i * sr) / (512 * mfFreq));
+    const vm = f * Math.exp(-dm * dm * mfNorm);
+    if (vm > motionAmp) motionAmp = vm;
   }
   prevSpectrum.set(spectrum);
   lowPassDrift = Math.max(lowPassDrift, 0);
+  motionAmp = Math.max(motionAmp, 0);
 
-  const lowPass = Math.pow(lowPassDrift, get('Motion Power')) * 0.0001;
-  lastHueFlux = lowPassDrift * 0.0001; // linear flux for hue shift
+  const lowPass = Math.pow(motionAmp, get('Motion Power')) * 0.0001;
+  lastHueFlux = lowPassDrift * 0.001; // linear flux for hue shift
 
   // --- Latent composition (StyleGAN branch) ---
   const cutoff = Math.round(get('Cutoff'));
@@ -384,7 +582,7 @@ function computeLatent(dt, nowSec) {
 
   // --- LSD latent modulation ---
   const lz = lsd.step({
-    pulseAmp: lowPassNormal,
+    pulseAmp: Math.max(pulseAmp, 0),
     motionAmp: lowPass,
     music: audioNoise,
     pulseMode: get('Pulse Mode'),
@@ -392,6 +590,7 @@ function computeLatent(dt, nowSec) {
     pulsePower: get('Pulse Power'),
     brightnessReact: get('Brightness React'),
     brightnessDir,
+    brightnessAmp: Math.max(lowPassBright, 0),
     motionReact: get('Motion React'),
     motionRandomness: get('Motion Randomness'),
     truncation: get('Truncation'),
@@ -399,7 +598,7 @@ function computeLatent(dt, nowSec) {
     pulseSmooth: get('Pulse Smooth'),
     motionSmooth: get('Motion Smooth'),
   });
-  thisHue = Math.round(lastHueFlux * get('Hue Shift') * 10);
+  thisHue = Math.round(lastHueFlux * get('Hue Shift'));
   return lz;
 }
 
@@ -438,6 +637,20 @@ function loop(now) {
     window.__dbg.demo = demo;
     window.__dbg.workletMsgs = audio.msgCount;
   }
+
+  // Panel spectrum display: raw spectrum, view applies its own smoothing.
+  // The filter points (draggable) visualize the Brightness/Pulse/Motion bands;
+  // their vertical position and bell height mirror each source's react value.
+  spectrumView.update(
+    spectrum,
+    audio.lastSampleRate || 48000,
+    dt,
+    {
+      pulse: filterInfo('Pulse Freq', 'Pulse Width', 'Pulse React'),
+      brightness: filterInfo('Brightness Freq', 'Brightness Width', 'Brightness React'),
+      motion: filterInfo('Motion Freq', 'Motion Width', 'Motion React'),
+    }
+  );
 
   // Meters once per half second.
   if (now - fpsWindow >= 500) {
@@ -500,9 +713,16 @@ function buildSliders() {
       input.max = def.max;
       input.step = def.step;
       input.value = def.value;
+      const setVal = () => {
+        valSpan.textContent = def.dec ? def.value.toFixed(def.dec) : def.value;
+      };
+      // Keep UI references so external changes (e.g. dragging the filter
+      // point on the spectrum) can sync the slider position and label.
+      def.uiInput = input;
+      def.uiVal = setVal;
       input.addEventListener('input', () => {
         def.value = parseFloat(input.value);
-        valSpan.textContent = def.dec ? def.value.toFixed(def.dec) : def.value;
+        setVal();
       });
 
       row.append(label, input);
@@ -518,9 +738,50 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 
+// Push an externally-changed setting into its slider UI (if visible).
+function syncSettingUI(name) {
+  const def = SETTINGS[name];
+  if (!def || !def.uiInput) return;
+  def.uiInput.value = def.value;
+  def.uiVal();
+}
+
 function setupUI() {
   buildSliders();
   resize();
+
+  // Dragging a filter point on the spectrum retunes that source's band (the
+  // horizontal axis = center frequency, the vertical axis = react amount); the
+  // mouse wheel changes its width. null args leave that axis as-is.
+  const FILTER_KEYS = {
+    pulse: { freq: 'Pulse Freq', width: 'Pulse Width', react: 'Pulse React' },
+    brightness: { freq: 'Brightness Freq', width: 'Brightness Width', react: 'Brightness React' },
+    motion: { freq: 'Motion Freq', width: 'Motion Width', react: 'Motion React' },
+  };
+  spectrumView.onFilterChange = (id, freq, width, react) => {
+    const keys = FILTER_KEYS[id] || FILTER_KEYS.brightness;
+    if (freq != null) {
+      SETTINGS[keys.freq].value = Math.min(
+        Math.max(Math.round(freq), SETTINGS[keys.freq].min),
+        SETTINGS[keys.freq].max
+      );
+      syncSettingUI(keys.freq);
+    }
+    if (width != null) {
+      SETTINGS[keys.width].value = Math.min(
+        Math.max(width, SETTINGS[keys.width].min),
+        SETTINGS[keys.width].max
+      );
+      syncSettingUI(keys.width);
+    }
+    if (react != null) {
+      SETTINGS[keys.react].value = Math.min(
+        Math.max(react, SETTINGS[keys.react].min),
+        SETTINGS[keys.react].max
+      );
+      syncSettingUI(keys.react);
+    }
+  };
 
   // Populate the thread dropdown: Auto (returns to the benchmarked best) plus
   // bare-number options. The selected option always shows just the current
@@ -533,6 +794,20 @@ function setupUI() {
   }
   elThreads.disabled = true;
   elThreads.addEventListener('change', () => applyThreads(elThreads.value));
+
+  // Populate the provider dropdown with every execution provider this browser
+  // exposes. Auto uses the benchmark winner; picking one forces it.
+  for (const p of detectProviders()) {
+    const opt = document.createElement('option');
+    opt.value = p;
+    opt.textContent = p;
+    elProvider.add(opt);
+  }
+  if (providerOverride) elProvider.value = providerOverride;
+  elProvider.disabled = true;
+  elProvider.addEventListener('change', () => applyProvider(elProvider.value));
+
+  elToast.addEventListener('click', hideBenchToast);
 
   document.getElementById('panel-toggle').addEventListener('click', () => {
     document.getElementById('panel').classList.add('collapsed');

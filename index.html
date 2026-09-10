@@ -42,6 +42,12 @@
           </select>
         </div>
         <div class="stat">
+          <span class="stat-label">Compute</span>
+          <select id="provider" class="stat-value" title="Inference execution provider (WebGPU / WebNN / WASM). Shows the benchmarked best; picking one overrides it (the model reloads when changed).">
+            <option value="auto">Auto</option>
+          </select>
+        </div>
+        <div class="stat">
           <span class="stat-label">Audio</span>
           <span id="audio" class="stat-value">off</span>
         </div>
@@ -83,6 +89,10 @@
         </button>
       </section>
 
+      <section class="viz">
+        <canvas id="spectrum" title="A-weighted power spectrum. Drag a colored point to retune its band: horizontal = center frequency, vertical = how strongly it reacts. Wheel adjusts band width."></canvas>
+      </section>
+
       <div id="sliders"></div>
     </div>
   </aside>
@@ -93,6 +103,12 @@
       <path d="M8 7l-5 5 5 5"/>
     </svg>
   </button>
+
+  <div id="bench-toast" class="toast" hidden role="status" aria-live="polite">
+    <div class="toast-title">Compute benchmark</div>
+    <div id="bench-rows" class="toast-rows"></div>
+    <div id="bench-note" class="toast-note"></div>
+  </div>
 
   <script type="module" src="/js/main.js"></script>
 </body>

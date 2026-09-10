@@ -64,7 +64,7 @@ export class LSDLatent {
   step({
     pulseAmp, motionAmp, music = null,
     pulseMode = 0, pulseReact = 0.5, pulsePower = 1.0,
-    brightnessReact = 0.5, brightnessDir = null,
+    brightnessReact = 0.5, brightnessDir = null, brightnessAmp = null,
     motionReact = 0.5, motionRandomness = 0.5,
     truncation = 1.0, fps = 60.0,
     pulseSmooth = 0.75, motionSmooth = 0.75,
@@ -99,7 +99,13 @@ export class LSDLatent {
     if (music != null) audioAdd = normalizeAs(music, d).map(x => x * pulseReact * p);
 
     let brightAdd = new Float32Array(d);
-    if (brightnessDir != null) brightAdd = normalizeAs(brightnessDir, d).map(x => x * brightnessReact * p);
+    if (brightnessDir != null) {
+      // Brightness gets its own amplitude so a frequency filter (see
+      // main.js `computeLatent`) can shape what it reacts to without
+      // affecting the classic pulse.
+      const bAmp = brightnessAmp == null ? p : brightnessAmp;
+      brightAdd = normalizeAs(brightnessDir, d).map(x => x * brightnessReact * bAmp);
+    }
 
     const motionAdd = new Float32Array(d);
     for (let i = 0; i < d; i++) motionAdd[i] = m * motionAmp * this.motionSigns[i] * this.randFactors[i];

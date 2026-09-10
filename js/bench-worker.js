@@ -1,21 +1,31 @@
 /**
- * One-shot benchmark worker for a single ONNX thread count.
+ * One-shot benchmark worker for a single ONNX compute configuration.
  *
  * onnxruntime-web bakes `env.wasm.numThreads` into the WASM module when it first
- * initializes and cannot resize the thread pool afterward inside the same realm.
- * So the inference worker spawns one of these per candidate thread count: each
- * instance is a fresh realm with its OWN WASM module, giving each thread count
- * a genuinely fresh pool.
+ * initializes and cannot resize the thread pool afterward inside the same realm,
+ * and a session's execution providers are fixed at creation. So the inference
+ * worker spawns one of these per candidate configuration: each instance is a
+ * fresh realm with its OWN module, giving every provider/thread count a clean
+ * start.
+ *
+ * A candidate is `{ provider, threads }` where provider is one of the
+ * onnxruntime-web execution providers (`wasm`, `webgpu`, `webnn`, `webgl`) and
+ * `threads` only matters for `wasm`. The worker loads the matching runtime:
+ *
+ *   - `wasm`  -> the small WASM-only build (lib/ort-wasm/ort.wasm.min.mjs)
+ *   - others  -> the full build (lib/ort-wasm/ort.all.min.mjs), which pulls in
+ *                the JSEP WASM binary that backs WebGPU/WebNN/WebGL.
  *
  * It loads the model with the same options the live session uses, warms up, then
  * times `runs` inferences and reports the MEDIAN (which survives GC spikes).
- * The parent picks the fewest threads whose median is within tolerance of the
- * fastest. This worker terminates itself after posting the result.
+ * The parent picks the fastest configuration. This worker terminates itself
+ * after posting the result.
  */
-import * as ort from '/lib/ort-wasm/ort.wasm.min.mjs';
-
-ort.env.wasm.wasmPaths = '/lib/ort-wasm/';
-ort.env.logLevel = 'warning';
+function moduleUrl(provider) {
+  return provider === 'wasm'
+    ? '/lib/ort-wasm/ort.wasm.min.mjs'
+    : '/lib/ort-wasm/ort.all.min.mjs';
+}
 
 function readDim(session) {
   const shape = session.inputMetadata ? session.inputMetadata.var?.shape : null;
@@ -29,11 +39,17 @@ self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type !== 'bench') return;
 
+  const provider = msg.provider || 'wasm';
+  const threads = Math.max(1, msg.threads | 0);
   let ms = Infinity;
   try {
-    ort.env.wasm.numThreads = Math.max(1, msg.threads | 0);
+    const ort = await import(moduleUrl(provider));
+    ort.env.wasm.wasmPaths = '/lib/ort-wasm/';
+    ort.env.logLevel = 'warning';
+    ort.env.wasm.numThreads = threads;
+
     const session = await ort.InferenceSession.create(msg.url, {
-      executionProviders: ['wasm'],
+      executionProviders: [provider],
       graphOptimizationLevel: 'all',
     });
 
@@ -57,11 +73,11 @@ self.onmessage = async (e) => {
     ms = times.length % 2 ? times[mid] : (times[mid - 1] + times[mid]) / 2;
   } catch (err) {
     ms = Infinity;
-    postMessage({ type: 'result', threads: msg.threads, ms, error: String(err) });
+    postMessage({ type: 'result', provider, threads, ms, error: String(err) });
     self.close();
     return;
   }
 
-  postMessage({ type: 'result', threads: msg.threads, ms });
+  postMessage({ type: 'result', provider, threads, ms });
   self.close();
 };

@@ -2,15 +2,18 @@
  * AudioWorkletProcessor that captures microphone PCM and computes a linear
  * magnitude spectrum, mirroring the Python `recording.get_sample` pipeline:
  *
- *   samples      = 512 floats (FFT size, matches the Python `blocksize`)
- *   windowed     = samples * Hann window
- *   spectrum     = |rfft(windowed)|  ->  257 bins
+ *   samples      = 1024 floats (FFT size)
+ *   windowed     = (samples - mean) * Hann window   (DC removed)
+ *   spectrum     = |rfft(windowed)|  ->  513 bins
  *
- * Unlike the Python app (which blocks until a fresh 512-sample chunk arrives,
- * ~11.6 ms of latency), a *sliding* 512-sample window ending at the current
- * sample is transformed after every 128-frame render quantum (~2.9 ms). This
- * cuts the capture-side latency from up to 11.6 ms to ~2.9 ms with no change
- * to the spectrum content the render loop consumes.
+ * The window mean is subtracted before windowing so any DC offset in the input
+ * does not leak into the lowest bins — with a coarse FFT that leakage
+ * otherwise pins the whole low-frequency end of the display at a constant
+ * height even in silence.
+ *
+ * A *sliding* 1024-sample window ending at the current sample is transformed
+ * after every 128-frame render quantum (~2.7 ms), so capture-side latency is a
+ * few ms rather than the full window length (~21 ms at 48 kHz).
  *
  * Each message posts the spectrum plus the audio-clock frame index of its
  * newest sample, so the main thread can measure the true audio -> GAN latency.
@@ -18,7 +21,7 @@
 class AudioSpectrumProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.block = 512;
+    this.block = 1024;
     this.bins = this.block / 2 + 1;
     // Ring buffer holding the last `block` samples (sliding window).
     this.ring = new Float32Array(this.block);
@@ -47,7 +50,7 @@ class AudioSpectrumProcessor extends AudioWorkletProcessor {
       this.filled = Math.min(this.filled + 1, this.block);
     }
     // Fresh spectrum after every render quantum. Skip until the ring holds a
-    // full 512-sample window (first ~11.6 ms of capture).
+    // full 1024-sample window (first ~21 ms of capture).
     if (this.filled < this.block) return true;
     this.compute(ch.length);
     return true;
@@ -56,10 +59,15 @@ class AudioSpectrumProcessor extends AudioWorkletProcessor {
   compute(chLen) {
     const n = this.block;
     const re = this.re, im = this.im, win = this.win, ring = this.ring, pos = this.pos;
+    // Mean of the window (DC), subtracted before windowing to keep a DC offset
+    // out of the low bins.
+    let mean = 0;
+    for (let k = 0; k < n; k++) mean += ring[(pos + k) % n];
+    mean /= n;
     // Re-window the last `n` samples in capture order.
     for (let k = 0; k < n; k++) {
       const idx = (pos + k) % n;
-      re[k] = ring[idx] * win[k];
+      re[k] = (ring[idx] - mean) * win[k];
       im[k] = 0;
     }
     fft(re, im, n);

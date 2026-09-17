@@ -22,6 +22,25 @@
     </div>
 
     <div class="panel-body" id="panel-body">
+      <section class="selectors">
+        <div class="box-title">Generator</div>
+        <div id="model-gallery" class="model-gallery" role="radiogroup" aria-label="Generator model"></div>
+        <div class="selector-grid">
+          <div class="selector">
+            <span class="stat-label">Compute</span>
+            <select id="provider" class="stat-value" title="Inference execution provider (WebGPU / WebNN / WASM). Shows the benchmarked best; picking one overrides it (the model reloads when changed).">
+              <option value="auto">Auto</option>
+            </select>
+          </div>
+          <div class="selector">
+            <span class="stat-label">Threads</span>
+            <select id="threads" class="stat-value" title="WASM inference threads. Shows the current count; picking a value overrides the benchmarked best (the model reloads when changed).">
+              <option value="auto">Auto</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
       <section class="stats">
         <div class="stat stat-status">
           <span class="stat-label">Status</span>
@@ -34,18 +53,6 @@
         <div class="stat">
           <span class="stat-label">Infer</span>
           <span id="infer" class="stat-value">--</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Threads</span>
-          <select id="threads" class="stat-value" title="WASM inference threads. Shows the current count; picking a value overrides the benchmarked best (the model reloads when changed).">
-            <option value="auto">Auto</option>
-          </select>
-        </div>
-        <div class="stat">
-          <span class="stat-label">Compute</span>
-          <select id="provider" class="stat-value" title="Inference execution provider (WebGPU / WebNN / WASM). Shows the benchmarked best; picking one overrides it (the model reloads when changed).">
-            <option value="auto">Auto</option>
-          </select>
         </div>
         <div class="stat">
           <span class="stat-label">Audio</span>

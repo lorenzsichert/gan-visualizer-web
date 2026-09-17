@@ -28,7 +28,9 @@ function moduleUrl(provider) {
 }
 
 function readDim(session) {
-  const shape = session.inputMetadata ? session.inputMetadata.var?.shape : null;
+  const meta = session.inputMetadata;
+  const entry = Array.isArray(meta) ? meta.find((m) => m.name === 'var') : meta?.var;
+  const shape = entry && entry.shape;
   if (shape && shape.length > 1 && Number.isFinite(shape[1]) && shape[1] > 0) {
     return Number(shape[1]);
   }

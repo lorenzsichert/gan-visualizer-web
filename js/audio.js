@@ -2,7 +2,7 @@
  * Microphone capture + spectrum management for the main thread.
  *
  * Mic audio flows through an AudioWorkletProcessor (worklets/audio-worklet.js)
- * which computes the 257-bin magnitude spectrum off-thread and posts it here.
+ * which computes the 513-bin magnitude spectrum off-thread and posts it here.
  * The newest spectrum is stored in `state.spectrum`; the render loop reads it
  * without touching the Web Audio graph.
  */
@@ -13,7 +13,7 @@ export class AudioPipeline {
     this.stream = null;
     this.source = null;
     this.running = false;
-    this.spectrum = new Float32Array(257);
+    this.spectrum = new Float32Array(513); // fftSize/2 + 1 (1024-point FFT)
     this.onStart = null;
     this.onStop = null;
     this.msgCount = 0;

@@ -110,7 +110,9 @@ self.onmessage = (e) => {
 };
 
 function readDim(session) {
-  const shape = session.inputMetadata ? session.inputMetadata[INPUT]?.shape : null;
+  const meta = session.inputMetadata;
+  const entry = Array.isArray(meta) ? meta.find((m) => m.name === INPUT) : meta?.[INPUT];
+  const shape = entry && entry.shape;
   if (shape && shape.length > 1 && Number.isFinite(shape[1]) && shape[1] > 0) {
     return Number(shape[1]);
   }
@@ -235,7 +237,11 @@ function isValidConfig(config, providers) {
 }
 
 async function init(msg) {
-  const url = msg.url || '/models/EndToEndNetwork.onnx';
+  const url = msg.url;
+  if (!url) {
+    postMessage({ type: 'status', text: 'no model selected' });
+    return;
+  }
   modelUrl = url;
   const providers =
     Array.isArray(msg.providers) && msg.providers.length ? msg.providers : ['wasm'];
@@ -260,13 +266,23 @@ async function init(msg) {
   await loadOrt(config.provider);
   if (config.provider === 'wasm') ort.env.wasm.numThreads = config.threads;
 
-  postMessage({ type: 'status', text: 'Loading model (14 MB)&hellip;' });
-  session = await withLock(() =>
-    ort.InferenceSession.create(url, {
-      executionProviders: [config.provider],
-      graphOptimizationLevel: 'all',
-    })
-  );
+  const label = msg.modelName || 'model';
+  postMessage({ type: 'status', text: `Loading ${label}&hellip;` });
+  try {
+    session = await withLock(() =>
+      ort.InferenceSession.create(url, {
+        executionProviders: [config.provider],
+        graphOptimizationLevel: 'all',
+      })
+    );
+  } catch (err) {
+    console.error(err);
+    postMessage({
+      type: 'status',
+      text: `Failed to load ${label}: ${err && err.message ? err.message : err}`,
+    });
+    return;
+  }
   dim = readDim(session);
   postMessage({
     type: 'ready',

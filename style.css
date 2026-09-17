@@ -121,9 +121,13 @@ button { font-family: inherit; }
   width: 34px;
   height: 34px;
   background: var(--surface);
+  transition: opacity 0.25s ease, background 0.12s ease;
 }
 
 #panel.collapsed ~ #panel-open { display: inline-flex; }
+
+/* Hide the opener while the pointer is idle; any mouse move reveals it again. */
+body.pointer-idle #panel-open { opacity: 0; pointer-events: none; }
 
 #panel-open:hover { background: var(--surface-3); }
 
@@ -164,6 +168,111 @@ button { font-family: inherit; }
 }
 
 .viz canvas:active { cursor: grabbing; }
+
+/* ---------- Selectors ---------- */
+.selectors {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  flex: none;
+}
+
+.box-title {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.model-gallery {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.model-tile {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.model-tile:hover { border-color: var(--text-faint); }
+
+.model-tile.selected {
+  border-color: var(--accent);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.model-thumb {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.model-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+
+.model-thumb img.ready { opacity: 1; }
+
+.model-thumb.loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.model-tile .model-name {
+  padding: 6px 8px 7px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.selector-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.selector {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.selector select.stat-value { width: 100%; }
 
 /* ---------- Telemetry ---------- */
 .stats {

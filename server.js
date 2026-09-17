@@ -12,14 +12,14 @@
  * backend run multi-threaded (pthreads) and use every available CPU core.
  * Without them inference silently falls back to a single thread.
  *
- * Usage:  node server.js [port]   (default port 8080)
+ * Usage:  node server.js [port]   (default port 1234)
  */
 import { createServer } from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const PORT = Number(process.env.PORT || process.argv[2] || 8080);
+const PORT = Number(process.env.PORT || process.argv[2] || 1234);
 const ROOT = fileURLToPath(new URL('./', import.meta.url));
 
 const MIME = {
@@ -59,6 +59,34 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Dynamic model index: every *.onnx in ./models, so dropping a new model
+  // into that directory makes it selectable without touching the app.
+  if (pathname === '/api/models') {
+    try {
+      const entries = await readdir(join(ROOT, 'models'), { withFileTypes: true });
+      const models = [];
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.onnx')) continue;
+        const info = await stat(join(ROOT, 'models', entry.name));
+        models.push({
+          name: entry.name,
+          url: '/models/' + encodeURIComponent(entry.name),
+          size: info.size,
+        });
+      }
+      models.sort((a, b) => a.name.localeCompare(b.name));
+      res.writeHead(200, {
+        'Content-Type': MIME['.json'],
+        'Cache-Control': 'no-cache',
+      });
+      res.end(JSON.stringify({ models }));
+    } catch {
+      res.writeHead(200, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-cache' });
+      res.end(JSON.stringify({ models: [] }));
+    }
+    return;
+  }
+
   if (pathname.endsWith('/')) pathname += 'index.html';
 
   const filePath = normalize(join(ROOT, pathname));
@@ -84,11 +112,11 @@ const server = createServer(async (req, res) => {
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
-    server.listen(0, '127.0.0.1'); // retry on any free port
+    console.error(`Port ${PORT} is already in use. Free it and restart, or set PORT to another fixed port.`);
   } else {
     console.error(err);
-    process.exit(1);
   }
+  process.exit(1);
 });
 
 server.listen(PORT, () => {

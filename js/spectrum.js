@@ -1,17 +1,29 @@
 /**
  * Power-spectrum display for the right panel.
  *
- * The 257-bin linear FFT magnitudes are resampled onto pixel columns spaced
- * logarithmically in frequency (equal width per semitone — exactly how the
- * keys of a piano are laid out), converted to power (10·log10(mag²)),
- * A-weighted so levels correspond to human loudness perception, and drawn as
- * a single clean white curve with faint octave gridlines at the C keys.
+ * The 257-bin spectrum is resampled onto pixel columns spaced logarithmically
+ * in frequency (equal width per semitone — exactly how the keys of a piano are
+ * laid out), converted to power (10·log10(mag²)), and drawn as a single clean
+ * white curve with faint octave gridlines at the C keys.
+ *
+ * The input is the SAME array the latent/LSD path consumes — the A-weighted,
+ * `Smoothing Factor`-smoothed spectrum from `main.js computeLatent` — so the
+ * draggable band filters line up with the data they shape. Because it is
+ * already A-weighted, this view does not weight it again, and it draws the
+ * data raw: no attack/release envelope, no auto-gain averaging, no blur.
  */
 
 const F_MIN = 50; // skip the sub-bass sliver: with a 512-sample FFT the
                   // bins below ~90 Hz are one blob anyway
 const F_MAX = 18000;
-const REF_DB = -60; // display floor, relative to the adaptive reference level
+// Fixed 0 dB reference (linear magnitude), so the curve shows absolute level
+// and never re-scales itself to the loudness of the input. A full-scale sine
+// is ~128 with this (un-normalized, Hann-windowed 512-point) FFT, so 128 is
+// digital full scale: nothing clips and the whole trace is real data. Typical
+// signals sit well below it — use the Preamp Gain slider, or lower REF_MAG, to
+// bring the trace up.
+const REF_MAG = 128;
+const REF_DB = -60; // display floor (dB below REF_MAG)
 
 /** A-weighting curve in dB (0 dB at 1 kHz). */
 export function aWeightDb(f) {
@@ -24,31 +36,12 @@ export function aWeightDb(f) {
   return 20 * Math.log10(num / den) + 2.0;
 }
 
-/** In-place box blur of `a[0..n)` with the given integer radius. */
-function boxBlur(a, n, r) {
-  if (n < 2 || r < 1) return;
-  const inv = 1 / (2 * r + 1);
-  for (let pass = 0; pass < 2; pass++) {
-    let sum = 0;
-    for (let i = -r; i <= r; i++) sum += a[Math.min(n - 1, Math.max(0, i))];
-    for (let i = 0; i < n; i++) {
-      a[i] = sum * inv;
-      sum -= a[Math.min(n - 1, Math.max(0, i - r))];
-      sum += a[Math.min(n - 1, Math.max(0, i + r + 1))];
-    }
-  }
-}
-
 export class SpectrumView {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
-    // Per-pixel-column displayed height (0..1), time-smoothed.
+    // Per-pixel-column displayed height (0..1), drawn raw each frame.
     this.level = new Float32Array(0);
-    // Slowly-decaying envelope of the loudest bin, used as the 0 dB
-    // reference so both the mic (arbitrary input gain) and the synthetic
-    // demo signal auto-fit the display.
-    this.refEnv = 0;
 
     // Per-source band filters (brightness, pulse, motion), each a Gaussian in
     // log-frequency space visualized as a draggable point with Gaussian decay.
@@ -145,11 +138,11 @@ export class SpectrumView {
   }
 
   /**
-   * Feed the current raw magnitude spectrum (linear, 257 bins).
-   * `filters` maps a filter id to { freq: Hz, width: octaves, react, reactMin,
-   * reactMax }.
+   * Feed the A-weighted, smoothed magnitude spectrum (linear, 257 bins) shared
+   * with the latent/LSD path. `filters` maps a filter id to { freq: Hz, width:
+   * octaves, react, reactMin, reactMax }.
    */
-  update(mags, sampleRate, dt, filters) {
+  update(mags, sampleRate, filters) {
     for (const f of this.filters) {
       const s = filters[f.id];
       if (s) {
@@ -183,14 +176,12 @@ export class SpectrumView {
     this._logSpan = logSpan;
     this._fMax = fMax;
 
-    // Adaptive 0 dB reference: instant attack, slow release.
-    let peak = 0;
-    for (let i = 0; i < mags.length; i++) if (mags[i] > peak) peak = mags[i];
-    this.refEnv = Math.max(peak, this.refEnv * Math.exp(-dt / 1.5));
-    const ref = Math.max(this.refEnv, 1e-4);
-    const ref2 = ref * ref;
+    // 0 dB reference is a fixed magnitude, not this frame's peak: the curve is
+    // drawn at its absolute level with no auto-gain of any kind.
+    const ref2 = REF_MAG * REF_MAG;
 
-    // Resample: max magnitude per log-spaced column, -> A-weighted dB.
+    // Resample: max magnitude per log-spaced column -> dB (already A-weighted
+    // upstream, so no perceptual weighting is applied here).
     const level = this.level;
     for (let x = 0; x < w; x++) {
       const f0 = Math.exp(logMin + (logSpan * x) / w);
@@ -199,24 +190,9 @@ export class SpectrumView {
       let b1 = Math.min(n, Math.max(b0 + 1, Math.ceil((f1 / nyq) * n)));
       let m = 0;
       for (let b = b0; b <= b1; b++) if (mags[b] > m) m = mags[b];
-      const db = 10 * Math.log10((m * m) / ref2 + 1e-12) + aWeightDb(Math.sqrt(f0 * f1));
-      const target = Math.min(1, Math.max(0, (db - REF_DB) / -REF_DB));
-      // Fast attack, slower release keeps the curve lively but clean.
-      const k = target > level[x] ? 1 - Math.exp(-dt / 0.03) : 1 - Math.exp(-dt / 0.22);
-      level[x] += k * (target - level[x]);
-    }
-
-    // Spatial smoothing (three box-blur passes ≈ Gaussian) turns the binny
-    // resampled spectrum into one really smooth curve.
-    boxBlur(level, w, 2);
-    boxBlur(level, w, 2);
-
-    // Taper the left edge down to the baseline with a smoothstep ramp so the
-    // curve grows out of the bottom instead of starting mid-air.
-    const fade = Math.max(3, Math.round(w * 0.07));
-    for (let x = 0; x < fade && x < w; x++) {
-      const t = x / fade;
-      level[x] *= t * t * (3 - 2 * t);
+      const db = 10 * Math.log10((m * m) / ref2 + 1e-12);
+      // Raw value for this frame: no smoothing, no blur, no envelope.
+      level[x] = Math.min(1, Math.max(0, (db - REF_DB) / -REF_DB));
     }
 
     this.draw(w, h, dpr);

@@ -14,7 +14,8 @@ import { SpectrumView, aWeightDb } from './spectrum.js';
 
 const W = 512;    // model output width
 const H = 512;    // model output height
-const BINS = 257; // spectrum bins (fftSize/2 + 1)
+const FFT_SIZE = 1024;         // FFT points (power of two)
+const BINS = FFT_SIZE / 2 + 1; // spectrum bins (513)
 
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
@@ -24,6 +25,7 @@ const elFps = document.getElementById('fps');
 const elInfer = document.getElementById('infer');
 const elThreads = document.getElementById('threads');
 const elProvider = document.getElementById('provider');
+const elModelGallery = document.getElementById('model-gallery');
 const elAudio = document.getElementById('audio');
 const elToast = document.getElementById('bench-toast');
 const elToastRows = document.getElementById('bench-rows');
@@ -45,9 +47,10 @@ let brightnessDir = null;
 let lastHueFlux = 0;
 let audioRandTimer = 0;
 
-// Per-bin A-weighting gain for the latent/LSD path, cached per sample rate
-// (mirrors the panel display's perceptual weighting). The raw `spectrum` fed
-// to SpectrumView is untouched so it isn't weighted twice.
+// Per-bin A-weighting gain, cached per sample rate. It is applied once to the
+// raw spectrum to produce `smoothed`; that smoothed spectrum is the single
+// source shared by the latent/LSD path and the panel spectrum view, so the
+// weighting must not be applied again downstream.
 let aWeightGain = null;
 let aWeightSR = 0;
 
@@ -87,13 +90,15 @@ function genDemoSpectrum(t, out) {
   const beat1 = 0.5 + 0.5 * Math.sin(t * 2.1);
   const beat2 = 0.5 + 0.5 * Math.sin(t * 3.7);
   out.fill(0);
+  // Peak centers/widths are bin indices for the 1024-point FFT (twice the
+  // 512-point indices, i.e. the same frequencies in Hz).
   const peaks = [
-    { f: 8, amp: 0.9 * beat1, w: 3 },
-    { f: 20, amp: 0.7 * beat1, w: 4 },
-    { f: 45, amp: 0.6 * beat2, w: 6 },
-    { f: 90, amp: 0.5 * beat2, w: 8 },
-    { f: 150, amp: 0.35, w: 10 },
-    { f: 220, amp: 0.3 * (0.5 + 0.5 * Math.sin(t * 5)), w: 12 },
+    { f: 16, amp: 0.9 * beat1, w: 6 },
+    { f: 40, amp: 0.7 * beat1, w: 8 },
+    { f: 90, amp: 0.6 * beat2, w: 12 },
+    { f: 180, amp: 0.5 * beat2, w: 16 },
+    { f: 300, amp: 0.35, w: 20 },
+    { f: 440, amp: 0.3 * (0.5 + 0.5 * Math.sin(t * 5)), w: 24 },
   ];
   for (const p of peaks) {
     for (let i = 0; i < BINS; i++) {
@@ -115,6 +120,260 @@ let ready = false;
 const CONFIG_KEY = 'compute-config';
 const OVERRIDE_KEY = 'threads-override';
 const PROVIDER_KEY = 'provider-override';
+const MODEL_KEY = 'model-url';
+
+// The model to load. `modelUrl` is a `/models/<file>.onnx` path; null means the
+// discovery list has not been fetched yet.
+let modelUrl = null;
+let modelList = [];
+
+// Models present at the time this app was written, used only when the dynamic
+// listing is unavailable. Keep in sync with models/.
+const FALLBACK_MODELS = [
+  'abstract_art_EndToEndNetwork.onnx',
+  'abstract_photo_EndToEndNetwork.onnx',
+];
+
+// Fetch the directory listing from the dev server (`/api/models`). On static
+// hosting where the endpoint is absent, fall back to the built-in list so the
+// app still boots.
+async function discoverModels() {
+  try {
+    const res = await fetch('/api/models', { cache: 'no-store' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Array.isArray(data.models) && data.models.length) {
+        return data.models;
+      }
+    }
+  } catch (err) {
+    /* No listing endpoint (static hosting) — use the fallback below. */
+  }
+  return FALLBACK_MODELS.map((name) => ({
+    name,
+    url: '/models/' + encodeURIComponent(name),
+    size: 0,
+  }));
+}
+
+// Human-readable label for a model file: drop the directory, extension and the
+// common `_EndToEndNetwork` suffix.
+function modelLabel(name) {
+  return name
+    .replace(/\.onnx$/i, '')
+    .replace(/_EndToEndNetwork$/i, '')
+    .replace(/_/g, ' ');
+}
+
+function loadSavedModel() {
+  const override = new URLSearchParams(location.search).get('model');
+  if (override) return override;
+  try {
+    const saved = localStorage.getItem(MODEL_KEY);
+    if (saved) return saved;
+  } catch (err) {
+    /* storage unavailable */
+  }
+  return null;
+}
+
+function saveModel(url) {
+  try {
+    localStorage.setItem(MODEL_KEY, url);
+  } catch (err) {
+    /* non-fatal */
+  }
+}
+
+// Switch models: persist the choice and rebuild the worker so it creates a
+// session against the new file.
+function applyModel(url) {
+  if (!url || url === modelUrl) return;
+  modelUrl = url;
+  saveModel(url);
+  markSelectedModel();
+  if (worker) restartWorker();
+}
+
+// Highlight the tile for the active model.
+function markSelectedModel() {
+  if (!elModelGallery) return;
+  for (const tile of elModelGallery.children) {
+    const on = tile.dataset.url === modelUrl;
+    tile.classList.toggle('selected', on);
+    tile.setAttribute('aria-checked', on ? 'true' : 'false');
+  }
+}
+
+// Build the model picker: one tile per discovered model, each with a
+// generated cover image (filled in asynchronously by generateCovers()).
+function buildModelGallery() {
+  if (!elModelGallery) return;
+  elModelGallery.innerHTML = '';
+  for (const m of modelList) {
+    const tile = document.createElement('button');
+    tile.type = 'button';
+    tile.className = 'model-tile';
+    tile.dataset.url = m.url;
+    tile.setAttribute('role', 'radio');
+    tile.setAttribute('aria-checked', 'false');
+    tile.title = m.size ? `${m.name} (${(m.size / 1048576).toFixed(1)} MB)` : m.name;
+
+    const thumb = document.createElement('span');
+    thumb.className = 'model-thumb loading';
+    const img = document.createElement('img');
+    img.alt = '';
+    thumb.appendChild(img);
+
+    const name = document.createElement('span');
+    name.className = 'model-name';
+    name.textContent = modelLabel(m.name);
+
+    tile.append(thumb, name);
+    tile.addEventListener('click', () => applyModel(m.url));
+    elModelGallery.appendChild(tile);
+  }
+  markSelectedModel();
+}
+
+// Discover the models, build the picker and pick which one to start with.
+async function bootModels() {
+  modelList = await discoverModels();
+  const valid = (url) => modelList.some((m) => m.url === url);
+
+  let wanted = loadSavedModel();
+  if (wanted && !valid(wanted)) {
+    // Accept a bare filename or an absolute path in the `?model=` override.
+    const guess = '/models/' + encodeURIComponent(wanted.replace(/^.*\//, ''));
+    wanted = valid(guess) ? guess : null;
+  }
+  modelUrl = wanted || (modelList[0] && modelList[0].url) || null;
+  buildModelGallery();
+}
+
+// ---------------------------------------------------------------------------
+// Model cover images
+// ---------------------------------------------------------------------------
+// Covers are rendered by js/cover-worker.js (one deterministic inference per
+// model) and cached as small JPEG data URLs keyed by URL + file size, so a
+// model is only ever rendered once per browser.
+const COVER_PREFIX = 'model-cover:';
+const COVER_SIZE = 160;
+const COVER_SEED = 0x5eed;
+
+let coverWorker = null;
+let coverBusy = false;
+let coversRequested = false;
+const coverQueue = [];
+const coverQueued = new Set();
+
+function coverKey(m) {
+  return `${COVER_PREFIX}${m.url}:${m.size || 0}`;
+}
+
+function loadCachedCover(m) {
+  try {
+    return localStorage.getItem(coverKey(m));
+  } catch (err) {
+    return null;
+  }
+}
+
+function saveCachedCover(m, dataUrl) {
+  try {
+    localStorage.setItem(coverKey(m), dataUrl);
+  } catch (err) {
+    /* Quota exceeded — regenerate next load. */
+  }
+}
+
+function tileFor(url) {
+  if (!elModelGallery) return null;
+  for (const tile of elModelGallery.children) {
+    if (tile.dataset.url === url) return tile;
+  }
+  return null;
+}
+
+function setCover(url, dataUrl) {
+  const tile = tileFor(url);
+  if (!tile) return;
+  const img = tile.querySelector('img');
+  const thumb = tile.querySelector('.model-thumb');
+  if (img) {
+    img.src = dataUrl;
+    img.classList.add('ready');
+  }
+  if (thumb) thumb.classList.remove('loading');
+}
+
+function rgbaToDataUrl(bytes, size) {
+  const raw = bytes instanceof Uint8ClampedArray ? bytes : new Uint8ClampedArray(bytes);
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.putImageData(new ImageData(raw, size, size), 0, 0);
+  return canvas.toDataURL('image/jpeg', 0.72);
+}
+
+function ensureCoverWorker() {
+  if (coverWorker) return coverWorker;
+  coverWorker = new Worker('/js/cover-worker.js', { type: 'module' });
+  coverWorker.onmessage = (e) => onCoverMessage(e.data);
+  coverWorker.onerror = () => {
+    coverBusy = false;
+    pumpCoverQueue();
+  };
+  return coverWorker;
+}
+
+function pumpCoverQueue() {
+  if (coverBusy || !coverQueue.length) return;
+  coverBusy = true;
+  const m = coverQueue.shift();
+  ensureCoverWorker().postMessage({ type: 'cover', url: m.url, seed: COVER_SEED });
+}
+
+function onCoverMessage(msg) {
+  coverBusy = false;
+  coverQueued.delete(msg.url);
+  if (msg.error) {
+    const tile = tileFor(msg.url);
+    if (tile) {
+      tile.classList.add('cover-failed');
+      const thumb = tile.querySelector('.model-thumb');
+      if (thumb) thumb.classList.remove('loading');
+    }
+  } else {
+    const dataUrl = rgbaToDataUrl(msg.bytes, msg.size || COVER_SIZE);
+    const m = modelList.find((x) => x.url === msg.url);
+    if (m) saveCachedCover(m, dataUrl);
+    setCover(msg.url, dataUrl);
+  }
+  pumpCoverQueue();
+}
+
+// Render covers for every model, the selected one first so it shows up soonest.
+function generateCovers() {
+  if (!elModelGallery) return;
+  const ordered = [...modelList].sort((a, b) => {
+    if (a.url === modelUrl) return -1;
+    if (b.url === modelUrl) return 1;
+    return 0;
+  });
+  for (const m of ordered) {
+    const cached = loadCachedCover(m);
+    if (cached) {
+      setCover(m.url, cached);
+      continue;
+    }
+    if (coverQueued.has(m.url)) continue;
+    coverQueued.add(m.url);
+    coverQueue.push(m);
+  }
+  pumpCoverQueue();
+}
 
 // null = auto (benchmarked); a number = the user's manual WASM thread override,
 // which skips the benchmark on (re)start because the thread pool is baked into
@@ -171,7 +430,8 @@ function cachedConfig() {
       detectProviders().includes(data.provider) &&
       Number.isInteger(data.threads) &&
       data.threads >= 1 &&
-      data.hw === (navigator.hardwareConcurrency || 0)
+      data.hw === (navigator.hardwareConcurrency || 0) &&
+      data.model === modelUrl
     ) {
       return { provider: data.provider, threads: data.threads };
     }
@@ -196,6 +456,8 @@ function initWorker() {
     cachedConfig:
       threadsOverride == null && providerOverride == null ? cachedConfig() : null,
     forceBench: new URLSearchParams(location.search).has('bench'),
+    url: modelUrl || undefined,
+    modelName: modelList.find((m) => m.url === modelUrl)?.name,
   });
 }
 
@@ -347,6 +609,7 @@ function handleWorker(msg) {
               provider: msg.bench.provider,
               threads: msg.bench.threads,
               hw: navigator.hardwareConcurrency || 0,
+              model: modelUrl,
             })
           );
         } catch (err) {
@@ -356,6 +619,12 @@ function handleWorker(msg) {
       finishBenchToast(msg);
       // Background brightness-direction discovery (doesn't block rendering).
       worker.postMessage({ type: 'brightness', samples: 48 });
+      // Generate model cover thumbnails once the live model is up, so the
+      // cover work never delays the first frame.
+      if (!coversRequested) {
+        coversRequested = true;
+        generateCovers();
+      }
       break;
     }
     case 'status':
@@ -491,15 +760,26 @@ function computeLatent(dt, nowSec) {
     spectrum.fill(0);
   }
 
+  // --- Preamp ---------------------------------------------------------------
+  // Broadband input gain (dB), applied to the raw magnitude spectrum before any
+  // downstream processing, so it scales the whole chain — A-weighting,
+  // smoothing, band filters and the latent/LSD modulation — for both the mic
+  // and the demo signal. Linear gain: dB = 20·log10(g).
+  const preampDb = get('Preamp Gain');
+  if (preampDb !== 0) {
+    const preampGain = Math.pow(10, preampDb / 20);
+    for (let i = 0; i < BINS; i++) spectrum[i] *= preampGain;
+  }
+
   // --- A-weighting (perceptual loudness, same curve as the panel display) ---
-  // The raw magnitude spectrum is the panel; the latent/LSD path uses this
-  // A-weighted version so levels follow human loudness perception. Gain is
-  // cached per sample rate; bin i's frequency is i * sr / 512 (fftSize).
+  // The preamped, A-weighted, smoothed spectrum is the shared signal consumed
+  // by both the latent/LSD path and the panel display. Gain is cached per
+  // sample rate; bin i's frequency is i * sr / FFT_SIZE.
   const sr = audio.lastSampleRate || 48000;
   if (!aWeightGain || aWeightSR !== sr) {
     if (!aWeightGain) aWeightGain = new Float32Array(BINS);
     for (let i = 0; i < BINS; i++) {
-      aWeightGain[i] = Math.pow(10, aWeightDb((i * sr) / 512) / 20);
+      aWeightGain[i] = Math.pow(10, aWeightDb((i * sr) / FFT_SIZE) / 20);
     }
     aWeightSR = sr;
   }
@@ -544,10 +824,10 @@ function computeLatent(dt, nowSec) {
   let pulseAmp = 0;
   let lowPassBright = 0;
   for (let i = 1; i < BINS; i++) {
-    const d = Math.log2((i * sr) / (512 * bfFreq));
+    const d = Math.log2((i * sr) / (FFT_SIZE * bfFreq));
     const v = smoothed[i] * Math.exp(-d * d * bfNorm);
     if (v > lowPassBright) lowPassBright = v;
-    const dp = Math.log2((i * sr) / (512 * pfFreq));
+    const dp = Math.log2((i * sr) / (FFT_SIZE * pfFreq));
     const vp = smoothed[i] * Math.exp(-dp * dp * pfNorm);
     if (vp > pulseAmp) pulseAmp = vp;
   }
@@ -558,7 +838,7 @@ function computeLatent(dt, nowSec) {
   for (let i = 0; i < BINS; i++) {
     const f = (spectrum[i] - prevSpectrum[i]) * invDt;
     if (f > lowPassDrift) lowPassDrift = f;
-    const dm = Math.log2((i * sr) / (512 * mfFreq));
+    const dm = Math.log2((i * sr) / (FFT_SIZE * mfFreq));
     const vm = f * Math.exp(-dm * dm * mfNorm);
     if (vm > motionAmp) motionAmp = vm;
   }
@@ -638,13 +918,12 @@ function loop(now) {
     window.__dbg.workletMsgs = audio.msgCount;
   }
 
-  // Panel spectrum display: raw spectrum, view applies its own smoothing.
-  // The filter points (draggable) visualize the Brightness/Pulse/Motion bands;
-  // their vertical position and bell height mirror each source's react value.
+  // Panel spectrum display: the SAME A-weighted, smoothed spectrum that drives
+  // the latent/LSD path (see `computeLatent`), drawn raw — the view applies no
+  // weighting, blur, envelope or auto-gain of its own.
   spectrumView.update(
-    spectrum,
+    smoothed,
     audio.lastSampleRate || 48000,
-    dt,
     {
       pulse: filterInfo('Pulse Freq', 'Pulse Width', 'Pulse React'),
       brightness: filterInfo('Brightness Freq', 'Brightness Width', 'Brightness React'),
@@ -816,6 +1095,21 @@ function setupUI() {
     document.getElementById('panel').classList.remove('collapsed');
   });
 
+  // Hide the floating sidebar opener while the pointer is idle; it reappears on
+  // any movement (motion, click, touch or keypress).
+  const IDLE_MS = 2500;
+  let idleTimer = 0;
+  const markPointerActive = () => {
+    document.body.classList.remove('pointer-idle');
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => document.body.classList.add('pointer-idle'), IDLE_MS);
+  };
+  window.addEventListener('mousemove', markPointerActive, { passive: true });
+  window.addEventListener('mousedown', markPointerActive, { passive: true });
+  window.addEventListener('touchstart', markPointerActive, { passive: true });
+  window.addEventListener('keydown', markPointerActive);
+  markPointerActive();
+
   const btnMic = document.getElementById('btn-mic');
   btnMic.addEventListener('click', async () => {
     if (audio.active) {
@@ -874,5 +1168,6 @@ function setupUI() {
 // ---------------------------------------------------------------------------
 window.__dbg = { ready: false, zPosted: 0, results: 0 };
 setupUI();
+await bootModels();
 initWorker();
 requestAnimationFrame(loop);

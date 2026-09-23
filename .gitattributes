@@ -3,4 +3,5 @@ models/abstract_photo_big_EndToEndNetwork.onnx filter=lfs diff=lfs merge=lfs -te
 models/abstract_photo_EndToEndNetwork.onnx filter=lfs diff=lfs merge=lfs -text
 models/flowers_big_EndToEndNetwork.onnx filter=lfs diff=lfs merge=lfs -text
 *.psd filter=lfs diff=lfs merge=lfs -text
+models/*.onnx filter=lfs diff=lfs merge=lfs -text
 *.onnx filter=lfs diff=lfs merge=lfs -text

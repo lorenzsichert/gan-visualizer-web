@@ -72,9 +72,23 @@ self.onmessage = async (e) => {
     try {
       const dim = readInputDim(session);
       const z = seededLatent(dim, msg.seed || DEFAULT_SEED);
-      const out = await session.run({
-        var: new ort.Tensor('float32', z, [1, dim]),
-      });
+      const feeds = { var: new ort.Tensor('float32', z, [1, dim]) };
+      // Feed zeros for any extra required input (e.g. the W offset `w_add`) so
+      // multi-input models can be rendered.
+      const names =
+        (session.inputNames && session.inputNames.length && [...session.inputNames]) ||
+        (session.inputMetadata || []).map((m) => m.name);
+      for (const name of names) {
+        if (name === 'var') continue;
+        const shape = (session.inputMetadata || []).find((m) => m.name === name)?.shape;
+        const dims =
+          shape && shape.length
+            ? shape.map((d) => (Number.isFinite(d) && d > 0 ? Number(d) : 1))
+            : [1, dim];
+        const count = dims.reduce((a, b) => a * b, 1);
+        feeds[name] = new ort.Tensor('float32', new Float32Array(count), dims);
+      }
+      const out = await session.run(feeds);
       const tensor = out[Object.keys(out)[0]];
       const data = tensor.data;
       const dims = tensor.dims;

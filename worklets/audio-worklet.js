@@ -2,26 +2,35 @@
  * AudioWorkletProcessor that captures microphone PCM and computes a linear
  * magnitude spectrum, mirroring the Python `recording.get_sample` pipeline:
  *
- *   samples      = 1024 floats (FFT size)
+ *   samples      = 2048 floats (FFT size)
  *   windowed     = (samples - mean) * Hann window   (DC removed)
- *   spectrum     = |rfft(windowed)|  ->  513 bins
+ *   spectrum     = |rfft(windowed)|  ->  1025 bins
+ *
+ * A larger 2048-point FFT halves the bin width (~23 Hz at 48 kHz), which the
+ * low end of the spectrum display and the band filters need to separate low
+ * notes. Magnitudes are
+ * rescaled by MAG_REF / block so the absolute level stays calibrated to the
+ * original 1024-point FFT — the spectrum display and the audio -> GAN
+ * modulation gains are unaffected by the resolution change.
  *
  * The window mean is subtracted before windowing so any DC offset in the input
  * does not leak into the lowest bins — with a coarse FFT that leakage
  * otherwise pins the whole low-frequency end of the display at a constant
  * height even in silence.
  *
- * A *sliding* 1024-sample window ending at the current sample is transformed
+ * A *sliding* 2048-sample window ending at the current sample is transformed
  * after every 128-frame render quantum (~2.7 ms), so capture-side latency is a
- * few ms rather than the full window length (~21 ms at 48 kHz).
+ * few ms rather than the full window length (~43 ms at 48 kHz).
  *
  * Each message posts the spectrum plus the audio-clock frame index of its
  * newest sample, so the main thread can measure the true audio -> GAN latency.
  */
+const MAG_REF = 1024; // FFT size the magnitude calibration is referenced to
+
 class AudioSpectrumProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.block = 1024;
+    this.block = 2048;
     this.bins = this.block / 2 + 1;
     // Ring buffer holding the last `block` samples (sliding window).
     this.ring = new Float32Array(this.block);
@@ -50,7 +59,7 @@ class AudioSpectrumProcessor extends AudioWorkletProcessor {
       this.filled = Math.min(this.filled + 1, this.block);
     }
     // Fresh spectrum after every render quantum. Skip until the ring holds a
-    // full 1024-sample window (first ~21 ms of capture).
+    // full window (first ~43 ms of capture).
     if (this.filled < this.block) return true;
     this.compute(ch.length);
     return true;
@@ -72,8 +81,11 @@ class AudioSpectrumProcessor extends AudioWorkletProcessor {
     }
     fft(re, im, n);
     const out = this.spectrum;
+    // Rescale to the 1024-point reference so the resolution change doesn't
+    // shift the absolute level seen by the display and the GAN modulation.
+    const scale = MAG_REF / n;
     for (let i = 0; i < this.bins; i++) {
-      out[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
+      out[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]) * scale;
     }
     // `currentFrame` is the frame index of this process block's first sample;
     // the newest sample just consumed is currentFrame + chLen - 1.

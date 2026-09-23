@@ -67,7 +67,7 @@ export class LSDLatent {
     brightnessReact = 0.5, brightnessDir = null, brightnessAmp = null,
     motionReact = 0.5, motionRandomness = 0.5,
     truncation = 1.0, fps = 60.0,
-    pulseSmooth = 0.75, motionSmooth = 0.75,
+    pulseSmooth = 0.75, brightnessSmooth = 0.75, motionSmooth = 0.75,
   }) {
     const d = this.dim;
     const first = this.frame === 0;
@@ -115,11 +115,12 @@ export class LSDLatent {
       // response is identical at any frame rate: per-frame factor s^(60/fps),
       // giving total decay s^(60*t) regardless of fps.
       const ps = Math.pow(pulseSmooth, 60 / fps);
+      const bs = Math.pow(brightnessSmooth, 60 / fps);
       const ms = Math.pow(motionSmooth, 60 / fps);
       for (let i = 0; i < d; i++) {
         pulseAdd[i] = this.pulseNoise[i] * ps + pulseAdd[i] * (1 - ps);
         audioAdd[i] = this.audioNoise[i] * ps + audioAdd[i] * (1 - ps);
-        brightAdd[i] = this.brightnessNoise[i] * ps + brightAdd[i] * (1 - ps);
+        brightAdd[i] = this.brightnessNoise[i] * bs + brightAdd[i] * (1 - bs);
         motionAdd[i] = this.motionNoise[i] * ms + motionAdd[i] * (1 - ms);
       }
     }

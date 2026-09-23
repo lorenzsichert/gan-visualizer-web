@@ -1,28 +1,29 @@
 /**
  * Power-spectrum display for the right panel.
  *
- * The 257-bin spectrum is resampled onto pixel columns spaced logarithmically
+ * The magnitude spectrum is resampled onto pixel columns spaced logarithmically
  * in frequency (equal width per semitone — exactly how the keys of a piano are
  * laid out), converted to power (10·log10(mag²)), and drawn as a single clean
  * white curve with faint octave gridlines at the C keys.
  *
- * The input is the SAME array the latent/LSD path consumes — the A-weighted,
- * `Smoothing Factor`-smoothed spectrum from `main.js computeLatent` — so the
- * draggable band filters line up with the data they shape. Because it is
- * already A-weighted, this view does not weight it again, and it draws the
- * data raw: no attack/release envelope, no auto-gain averaging, no blur.
+ * The input is the A-weighted, `Smoothing Factor`-smoothed spectrum from
+ * `main.js computeLatent`. Because it is already A-weighted, this view does not
+ * weight it again, and it draws the data raw: no attack/release envelope, no
+ * auto-gain averaging, no blur. The brightness and pulse filters shape the same
+ * A-weighted spectrum BEFORE the display smoothing, so they track their bands
+ * immediately while the curve itself stays smoothed.
  */
 
-const F_MIN = 50; // skip the sub-bass sliver: with a 512-sample FFT the
-                  // bins below ~90 Hz are one blob anyway
+const F_MIN = 50; // skip the sub-bass sliver: below ~50 Hz the bins are
+                  // still close together
 const F_MAX = 18000;
 // Fixed 0 dB reference (linear magnitude), so the curve shows absolute level
-// and never re-scales itself to the loudness of the input. A full-scale sine
-// is ~128 with this (un-normalized, Hann-windowed 512-point) FFT, so 128 is
-// digital full scale: nothing clips and the whole trace is real data. Typical
-// signals sit well below it — use the Preamp Gain slider, or lower REF_MAG, to
-// bring the trace up.
-const REF_MAG = 128;
+// and never re-scales itself to the loudness of the input. The worklet rescales
+// its 2048-point FFT to the original 1024-point reference (a full-scale sine is
+// ~256 there), so this reference stays valid across FFT sizes. Typical signals
+// sit well below it — use the Preamp Gain slider, or lower REF_MAG, to bring the
+// trace up.
+export const REF_MAG = 128; // full-scale sine magnitude (see buildWInjection loudness)
 const REF_DB = -60; // display floor (dB below REF_MAG)
 
 /** A-weighting curve in dB (0 dB at 1 kHz). */
@@ -40,7 +41,7 @@ export class SpectrumView {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
-    // Per-pixel-column displayed height (0..1), drawn raw each frame.
+    // Per-pixel-column displayed height (0..1), drawn each frame.
     this.level = new Float32Array(0);
 
     // Per-source band filters (brightness, pulse, motion), each a Gaussian in
@@ -138,9 +139,9 @@ export class SpectrumView {
   }
 
   /**
-   * Feed the A-weighted, smoothed magnitude spectrum (linear, 257 bins) shared
-   * with the latent/LSD path. `filters` maps a filter id to { freq: Hz, width:
-   * octaves, react, reactMin, reactMax }.
+   * Feed the A-weighted, smoothed magnitude spectrum (linear, one bin per FFT
+   * frequency) shared with the latent/LSD path. `filters` maps a filter id to
+   * { freq: Hz, width: octaves, react, reactMin, reactMax }.
    */
   update(mags, sampleRate, filters) {
     for (const f of this.filters) {
@@ -191,7 +192,6 @@ export class SpectrumView {
       let m = 0;
       for (let b = b0; b <= b1; b++) if (mags[b] > m) m = mags[b];
       const db = 10 * Math.log10((m * m) / ref2 + 1e-12);
-      // Raw value for this frame: no smoothing, no blur, no envelope.
       level[x] = Math.min(1, Math.max(0, (db - REF_DB) / -REF_DB));
     }
 

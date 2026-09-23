@@ -79,9 +79,61 @@ function withLock(fn) {
 
 let modelUrl = '/models/EndToEndNetwork.onnx';
 
+// Optional second model input: the W-space offset (`w_add`, shape
+// [1, layers, 512]) the model adds to the mapped w before synthesis. When the
+// loaded model declares it, it is fed on every run — zeros by default, or the
+// vector carried by the latest `z` message (tiled across the per-layer axis).
+let wInput = null;
+let wDims = null;
+let wCount = 0;
+let wAdd = null;
+
+function configureIO(s) {
+  const names =
+    (s.inputNames && s.inputNames.length && [...s.inputNames]) ||
+    (s.inputMetadata || []).map((m) => m.name);
+  const others = names.filter((n) => n !== INPUT);
+  wInput = others.includes('w_add') ? 'w_add' : others[0] || null;
+  if (!wInput) {
+    wDims = null;
+    wCount = 0;
+    wAdd = null;
+    return;
+  }
+  const meta = (s.inputMetadata || []).find((m) => m.name === wInput);
+  const shape = meta && meta.shape;
+  wDims =
+    shape && shape.length
+      ? shape.map((d) => (Number.isFinite(d) && d > 0 ? Number(d) : 1))
+      : [1, 512];
+  wCount = wDims.reduce((a, b) => a * b, 1);
+  wAdd = new Float32Array(wCount);
+}
+
+// Copy a supplied W vector into the persistent buffer, tiling a shorter vector
+// across the remaining axis (a single 512-D w reused for every layer).
+function applyW(vec) {
+  if (!wInput || !wAdd || vec == null) return;
+  const src = vec instanceof Float32Array ? vec : Float32Array.from(vec);
+  if (!src.length) return;
+  if (src.length === wCount) {
+    wAdd.set(src);
+  } else if (wCount % src.length === 0) {
+    for (let i = 0; i < wCount; i += src.length) wAdd.set(src, i);
+  }
+}
+
+function wFeed() {
+  if (!wInput || !wAdd) return {};
+  return { [wInput]: new ort.Tensor('float32', wAdd, wDims) };
+}
+
 async function brightnessOfOn(z) {
   const result = await withLock(() =>
-    session.run({ [INPUT]: new ort.Tensor('float32', z, [1, z.length]) })
+    session.run({
+      [INPUT]: new ort.Tensor('float32', z, [1, z.length]),
+      ...wFeed(),
+    })
   );
   const d = result[OUTPUT].data;
   let s = 0;
@@ -94,6 +146,7 @@ self.onmessage = (e) => {
   if (msg.type === 'init') {
     init(msg);
   } else if (msg.type === 'z') {
+    if (msg.w) applyW(msg.w);
     latestZ = msg.z;
     latestTanh = !!msg.tanh;
     latestHue = msg.hue || 0;
@@ -283,6 +336,7 @@ async function init(msg) {
     });
     return;
   }
+  configureIO(session);
   dim = readDim(session);
   postMessage({
     type: 'ready',
@@ -291,6 +345,10 @@ async function init(msg) {
     threads: config.provider === 'wasm' ? ort.env.wasm.numThreads : 0,
     multithreaded: HAS_SAB,
     bench: lastBench,
+    hasW: !!wInput,
+    wInput,
+    wShape: wDims ? wDims.slice() : null,
+    wCount,
   });
 }
 
@@ -304,7 +362,10 @@ async function pump() {
 
     const t0 = performance.now();
     const out = await withLock(() =>
-      session.run({ [INPUT]: new ort.Tensor('float32', z, [1, dim]) })
+      session.run({
+        [INPUT]: new ort.Tensor('float32', z, [1, dim]),
+        ...wFeed(),
+      })
     );
     const tensor = out[OUTPUT];
     const data = tensor.data;
@@ -366,10 +427,13 @@ async function pump() {
  * byte buffer (layout-independent), on the worker so the main thread only
  * blits.
  */
-const rowTmp = new Uint8Array(512);
-const colTmp = new Uint8Array(512);
+let rowTmp = new Uint8Array(512);
+let colTmp = new Uint8Array(512);
 
 function hueShiftBytes(bytes, shift, WW, HH) {
+  // Grow the scratch rows/cols for model resolutions above 512.
+  if (rowTmp.length < WW) rowTmp = new Uint8Array(WW);
+  if (colTmp.length < HH) colTmp = new Uint8Array(HH);
   for (let y = 0; y < HH; y++) {
     const row = y * WW * 4;
     for (let x = 0; x < WW; x++) rowTmp[x] = bytes[row + x * 4];

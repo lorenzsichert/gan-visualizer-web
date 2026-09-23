@@ -10,12 +10,10 @@
 import { SETTINGS, GROUP_ORDER, get } from './settings.js';
 import { LSDLatent, randn } from './lsd.js';
 import { AudioPipeline } from './audio.js';
-import { SpectrumView, aWeightDb } from './spectrum.js';
+import { SpectrumView, aWeightDb, REF_MAG } from './spectrum.js';
 
-const W = 512;    // model output width
-const H = 512;    // model output height
-const FFT_SIZE = 1024;         // FFT points (power of two)
-const BINS = FFT_SIZE / 2 + 1; // spectrum bins (513)
+const FFT_SIZE = 2048;         // FFT points (power of two)
+const BINS = FFT_SIZE / 2 + 1; // spectrum bins (1025)
 
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
@@ -62,6 +60,7 @@ function initLatentState(dim) {
   a = randn(dim);
   smoothed.fill(0);
   prevSpectrum.fill(0);
+  pulseSpectrum.fill(0);
   lsd = new LSDLatent(dim, get('Truncation'), get('Motion Randomness'));
 }
 
@@ -71,6 +70,12 @@ function initLatentState(dim) {
 const audio = new AudioPipeline();
 const spectrumView = new SpectrumView(document.getElementById('spectrum'));
 let demo = false;
+
+// W-space injection source: the first W_SPECTRUM_DIM spectrum bins, filtered by
+// the blue pulse band in computeLatent (A-weighted, no display smoothing) and
+// smoothed by Pulse Smooth. buildWInjection pushes it straight into W space.
+const W_SPECTRUM_DIM = 512; // model W width
+let pulseSpectrum = new Float32Array(W_SPECTRUM_DIM);
 // 0 = off, 1 = mirror (sharp tiles), 2 = mirror + blurred side tiles.
 let mirrorMode = 2;
 
@@ -90,15 +95,15 @@ function genDemoSpectrum(t, out) {
   const beat1 = 0.5 + 0.5 * Math.sin(t * 2.1);
   const beat2 = 0.5 + 0.5 * Math.sin(t * 3.7);
   out.fill(0);
-  // Peak centers/widths are bin indices for the 1024-point FFT (twice the
-  // 512-point indices, i.e. the same frequencies in Hz).
+  // Peak centers/widths are bin indices for the 2048-point FFT, chosen to sit
+  // at the same frequencies in Hz as the original 1024-point demo.
   const peaks = [
-    { f: 16, amp: 0.9 * beat1, w: 6 },
-    { f: 40, amp: 0.7 * beat1, w: 8 },
-    { f: 90, amp: 0.6 * beat2, w: 12 },
-    { f: 180, amp: 0.5 * beat2, w: 16 },
-    { f: 300, amp: 0.35, w: 20 },
-    { f: 440, amp: 0.3 * (0.5 + 0.5 * Math.sin(t * 5)), w: 24 },
+    { f: 32, amp: 0.9 * beat1, w: 12 },
+    { f: 80, amp: 0.7 * beat1, w: 16 },
+    { f: 180, amp: 0.6 * beat2, w: 24 },
+    { f: 360, amp: 0.5 * beat2, w: 32 },
+    { f: 600, amp: 0.35, w: 40 },
+    { f: 880, amp: 0.3 * (0.5 + 0.5 * Math.sin(t * 5)), w: 48 },
   ];
   for (const p of peaks) {
     for (let i = 0; i < BINS; i++) {
@@ -132,6 +137,7 @@ let modelList = [];
 const FALLBACK_MODELS = [
   'abstract_art_EndToEndNetwork.onnx',
   'abstract_photo_EndToEndNetwork.onnx',
+  'abstract_photo_big_EndToEndNetwork.onnx',
 ];
 
 // Fetch the directory listing from the dev server (`/api/models`). On static
@@ -163,6 +169,15 @@ function modelLabel(name) {
     .replace(/\.onnx$/i, '')
     .replace(/_EndToEndNetwork$/i, '')
     .replace(/_/g, ' ');
+}
+
+// The .onnx files are served with a long immutable cache, so a re-exported model
+// would otherwise stay stale in the browser. The listing carries each file's
+// size; append it as a version query so a changed model gets a fresh URL.
+function versionedUrl(url) {
+  const m = modelList.find((x) => x.url === url);
+  if (!m || !m.size) return url;
+  return `${url}?v=${m.size}`;
 }
 
 function loadSavedModel() {
@@ -252,6 +267,34 @@ async function bootModels() {
 }
 
 // ---------------------------------------------------------------------------
+// W-space injection (blue pulse filter -> W offset)
+// ---------------------------------------------------------------------------
+// A model whose ONNX declares a `w_add` input accepts an additive offset in W
+// space. The blue pulse filter is applied to the first W_SPECTRUM_DIM spectrum
+// bins, and those filtered values are pushed straight into W space (see
+// buildWInjection).
+let wScratch = null;
+let lastWMag = 0;
+
+// Push the pulse-filtered spectrum straight into W space. Pulse React scales
+// the whole vector and REF_MAG keeps it calibrated to full scale (a full-scale
+// tone maps to ~Pulse React). Reuses a scratch buffer; the worker gets a copy.
+function buildWInjection() {
+  lastWMag = 0;
+  const n = W_SPECTRUM_DIM;
+  if (!wScratch || wScratch.length !== n) wScratch = new Float32Array(n);
+  const gain = get('Pulse React') / REF_MAG;
+  let mag = 0;
+  for (let i = 0; i < n; i++) {
+    const v = pulseSpectrum[i] * gain;
+    wScratch[i] = v;
+    if (Math.abs(v) > mag) mag = Math.abs(v);
+  }
+  lastWMag = mag;
+  return wScratch;
+}
+
+// ---------------------------------------------------------------------------
 // Model cover images
 // ---------------------------------------------------------------------------
 // Covers are rendered by js/cover-worker.js (one deterministic inference per
@@ -332,14 +375,20 @@ function pumpCoverQueue() {
   if (coverBusy || !coverQueue.length) return;
   coverBusy = true;
   const m = coverQueue.shift();
-  ensureCoverWorker().postMessage({ type: 'cover', url: m.url, seed: COVER_SEED });
+  ensureCoverWorker().postMessage({ type: 'cover', url: versionedUrl(m.url), seed: COVER_SEED });
 }
 
 function onCoverMessage(msg) {
   coverBusy = false;
-  coverQueued.delete(msg.url);
+  // The worker echoes back the versioned URL it was given; resolve it to the
+  // model's plain URL, which is what the tiles and cover cache are keyed by.
+  const m =
+    modelList.find((x) => versionedUrl(x.url) === msg.url) ||
+    modelList.find((x) => x.url === msg.url);
+  const key = m ? m.url : msg.url;
+  coverQueued.delete(key);
   if (msg.error) {
-    const tile = tileFor(msg.url);
+    const tile = tileFor(key);
     if (tile) {
       tile.classList.add('cover-failed');
       const thumb = tile.querySelector('.model-thumb');
@@ -347,9 +396,8 @@ function onCoverMessage(msg) {
     }
   } else {
     const dataUrl = rgbaToDataUrl(msg.bytes, msg.size || COVER_SIZE);
-    const m = modelList.find((x) => x.url === msg.url);
     if (m) saveCachedCover(m, dataUrl);
-    setCover(msg.url, dataUrl);
+    setCover(key, dataUrl);
   }
   pumpCoverQueue();
 }
@@ -448,6 +496,8 @@ function initWorker() {
     elStatus.textContent = 'worker error: ' + e.message;
     console.error(e);
   };
+  const src = modelUrl ? versionedUrl(modelUrl) : undefined;
+  if (window.__dbg) window.__dbg.modelSrc = src || null;
   worker.postMessage({
     type: 'init',
     providers: detectProviders(),
@@ -456,7 +506,7 @@ function initWorker() {
     cachedConfig:
       threadsOverride == null && providerOverride == null ? cachedConfig() : null,
     forceBench: new URLSearchParams(location.search).has('bench'),
-    url: modelUrl || undefined,
+    url: modelUrl ? versionedUrl(modelUrl) : undefined,
     modelName: modelList.find((m) => m.url === modelUrl)?.name,
   });
 }
@@ -588,6 +638,8 @@ function handleWorker(msg) {
       initLatentState(msg.dim || DIM);
       elStatus.textContent = 'model ready';
       window.__dbg.bench = msg.bench;
+      window.__dbg.hasW = !!msg.hasW;
+      window.__dbg.wCount = msg.wCount || 0;
       // The threads dropdown only applies to the WASM provider; show the
       // calibrated provider in its own dropdown.
       const isWasm = msg.provider === 'wasm';
@@ -634,7 +686,7 @@ function handleWorker(msg) {
       addBenchRow(msg.provider, msg.threads, msg.ms);
       break;
     case 'result':
-      renderResult(msg.bytes, msg.ms);
+      renderResult(msg.bytes, msg.ms, msg.dims);
       // Ack the frame so the worker starts the next inference only after this
       // one was actually displayed (bounds the worker->main result queue).
       worker.postMessage({ type: 'render-done' });
@@ -649,11 +701,24 @@ function handleWorker(msg) {
 // ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
+// Offscreen frame, resized to whatever resolution the active model outputs
+// (256, 512, 1024, ...) — the worker reports its output dims with each frame.
 const off = document.createElement('canvas');
-off.width = W;
-off.height = H;
 const offCtx = off.getContext('2d');
-const img = offCtx.createImageData(W, H);
+let renderW = 512;
+let renderH = 512;
+off.width = renderW;
+off.height = renderH;
+let img = offCtx.createImageData(renderW, renderH);
+
+function ensureRenderSize(w, h) {
+  if (w === renderW && h === renderH) return;
+  renderW = w;
+  renderH = h;
+  off.width = w;
+  off.height = h;
+  img = offCtx.createImageData(w, h);
+}
 
 // Low-res blurred copy of the frame, pre-rendered once per frame when mirror
 // mode 2 is active. Blurring with ctx.filter is expensive on the main thread
@@ -663,15 +728,19 @@ const img = offCtx.createImageData(W, H);
 const blurTile = document.createElement('canvas');
 const blurTileCtx = blurTile.getContext('2d');
 
-function renderResult(bytes, ms) {
+function renderResult(bytes, ms, dims) {
+  // dims is [height, width] as reported by the worker.
+  const rw = dims && dims[1] > 0 ? dims[1] : renderW;
+  const rh = dims && dims[0] > 0 ? dims[0] : renderH;
+  ensureRenderSize(rw, rh);
   img.data.set(bytes);
   offCtx.putImageData(img, 0, 0);
 
   const cw = canvas.width;
   const ch = canvas.height;
-  const scale = Math.min(cw / W, ch / H);
-  const dw = W * scale;
-  const dh = H * scale;
+  const scale = Math.min(cw / rw, ch / rh);
+  const dw = rw * scale;
+  const dh = rh * scale;
   const y = (ch - dh) / 2;
   const x = (cw - dw) / 2;
 
@@ -773,8 +842,9 @@ function computeLatent(dt, nowSec) {
 
   // --- A-weighting (perceptual loudness, same curve as the panel display) ---
   // The preamped, A-weighted, smoothed spectrum is the shared signal consumed
-  // by both the latent/LSD path and the panel display. Gain is cached per
-  // sample rate; bin i's frequency is i * sr / FFT_SIZE.
+  // by the latent/LSD path and the panel display; brightness and pulse instead
+  // read the same weighting WITHOUT the display smoothing (below). Gain is
+  // cached per sample rate; bin i's frequency is i * sr / FFT_SIZE.
   const sr = audio.lastSampleRate || 48000;
   if (!aWeightGain || aWeightSR !== sr) {
     if (!aWeightGain) aWeightGain = new Float32Array(BINS);
@@ -809,27 +879,42 @@ function computeLatent(dt, nowSec) {
 
   // --- Flux / low-pass measures ---
   // Brightness, pulse and motion each respond through a Gaussian band filter in
-  // log-frequency space (draggable on the spectrum for brightness): they react
-  // only around their center frequency, decaying smoothly to both sides.
+  // log-frequency space (draggable on the spectrum): they react only around
+  // their center frequency, decaying smoothly to both sides. Motion reacts to
+  // flux; brightness and the blue pulse react to A-weighted magnitude WITHOUT
+  // the display smoothing, so they follow the band immediately. The pulse
+  // filter's per-bin output is pushed into W space (see buildWInjection).
   const bfFreq = Math.max(get('Brightness Freq'), 1);
   const bfWidth = Math.max(get('Brightness Width'), 0.05);
   const bfNorm = 1 / (2 * bfWidth * bfWidth);
-  const pfFreq = Math.max(get('Pulse Freq'), 1);
-  const pfWidth = Math.max(get('Pulse Width'), 0.05);
-  const pfNorm = 1 / (2 * pfWidth * pfWidth);
   const mfFreq = Math.max(get('Motion Freq'), 1);
   const mfWidth = Math.max(get('Motion Width'), 0.05);
   const mfNorm = 1 / (2 * mfWidth * mfWidth);
+  const pfFreq = Math.max(get('Pulse Freq'), 1);
+  const pfWidth = Math.max(get('Pulse Width'), 0.05);
+  const pfNorm = 1 / (2 * pfWidth * pfWidth);
 
-  let pulseAmp = 0;
   let lowPassBright = 0;
   for (let i = 1; i < BINS; i++) {
     const d = Math.log2((i * sr) / (FFT_SIZE * bfFreq));
-    const v = smoothed[i] * Math.exp(-d * d * bfNorm);
+    // A-weighted raw (preamped) spectrum, not the EMA-smoothed one, so the
+    // brightness react follows the band immediately instead of through the
+    // display smoothing.
+    const v = spectrum[i] * aWeightGain[i] * Math.exp(-d * d * bfNorm);
     if (v > lowPassBright) lowPassBright = v;
-    const dp = Math.log2((i * sr) / (FFT_SIZE * pfFreq));
-    const vp = smoothed[i] * Math.exp(-dp * dp * pfNorm);
-    if (vp > pulseAmp) pulseAmp = vp;
+  }
+
+  // Blue pulse filter, applied per bin to the first W_SPECTRUM_DIM bins of the
+  // A-weighted raw spectrum (no display smoothing). These become the W-space
+  // injection directly, so the band shapes which W dimensions move. Pulse
+  // Smooth EMA (60 fps-normalized, matching the LSD EMAs) glides the vector.
+  const pulsePs = Math.pow(get('Pulse Smooth'), 60 * dt);
+  for (let i = 0; i < W_SPECTRUM_DIM && i < BINS; i++) {
+    const f = (i * sr) / FFT_SIZE;
+    const d = Math.log2(f / pfFreq);
+    const w = Math.exp(-d * d * pfNorm);
+    const target = spectrum[i] * aWeightGain[i] * w;
+    pulseSpectrum[i] = pulseSpectrum[i] * pulsePs + target * (1 - pulsePs);
   }
 
   const invDt = 1 / Math.max(dt, 1e-6);
@@ -862,7 +947,7 @@ function computeLatent(dt, nowSec) {
 
   // --- LSD latent modulation ---
   const lz = lsd.step({
-    pulseAmp: Math.max(pulseAmp, 0),
+    pulseAmp: 0, // the blue pulse filter drives the W-space injection, not the latent
     motionAmp: lowPass,
     music: audioNoise,
     pulseMode: get('Pulse Mode'),
@@ -876,6 +961,7 @@ function computeLatent(dt, nowSec) {
     truncation: get('Truncation'),
     fps: 1 / Math.max(dt, 1e-6),
     pulseSmooth: get('Pulse Smooth'),
+    brightnessSmooth: get('Brightness Smooth'),
     motionSmooth: get('Motion Smooth'),
   });
   thisHue = Math.round(lastHueFlux * get('Hue Shift'));
@@ -899,10 +985,12 @@ function loop(now) {
 
   if (ready && lsd) {
     const z = computeLatent(dt, nowSec);
+    const w = buildWInjection();
     // Latest-wins: post every frame; the worker drops stale work.
     worker.postMessage({
       type: 'z',
       z,
+      w,
       tanh: get('Tanh Output') !== 0,
       hue: thisHue,
     });
@@ -916,6 +1004,7 @@ function loop(now) {
     window.__dbg.audioActive = audio.active;
     window.__dbg.demo = demo;
     window.__dbg.workletMsgs = audio.msgCount;
+    window.__dbg.wInj = +lastWMag.toFixed(4);
   }
 
   // Panel spectrum display: the SAME A-weighted, smoothed spectrum that drives

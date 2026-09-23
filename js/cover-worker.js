@@ -11,6 +11,8 @@
  * soon as its cover is produced. A fixed seed keeps a model's cover identical
  * across reloads and machines, which makes the on-disk cache valid.
  */
+import { fetchModelBytes } from './model-cache.js';
+
 const DEFAULT_DIM = 512;
 const COVER_SIZE = 160;
 const DEFAULT_SEED = 0x5eed;
@@ -64,7 +66,7 @@ self.onmessage = async (e) => {
     ort.env.logLevel = 'error';
     ort.env.wasm.numThreads = 1;
 
-    const session = await ort.InferenceSession.create(msg.url, {
+    const session = await ort.InferenceSession.create(await fetchModelBytes(msg.url), {
       executionProviders: ['wasm'],
       graphOptimizationLevel: 'all',
     });
@@ -73,21 +75,6 @@ self.onmessage = async (e) => {
       const dim = readInputDim(session);
       const z = seededLatent(dim, msg.seed || DEFAULT_SEED);
       const feeds = { var: new ort.Tensor('float32', z, [1, dim]) };
-      // Feed zeros for any extra required input (e.g. the W offset `w_add`) so
-      // multi-input models can be rendered.
-      const names =
-        (session.inputNames && session.inputNames.length && [...session.inputNames]) ||
-        (session.inputMetadata || []).map((m) => m.name);
-      for (const name of names) {
-        if (name === 'var') continue;
-        const shape = (session.inputMetadata || []).find((m) => m.name === name)?.shape;
-        const dims =
-          shape && shape.length
-            ? shape.map((d) => (Number.isFinite(d) && d > 0 ? Number(d) : 1))
-            : [1, dim];
-        const count = dims.reduce((a, b) => a * b, 1);
-        feeds[name] = new ort.Tensor('float32', new Float32Array(count), dims);
-      }
       const out = await session.run(feeds);
       const tensor = out[Object.keys(out)[0]];
       const data = tensor.data;

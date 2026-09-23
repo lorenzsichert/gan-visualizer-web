@@ -24,6 +24,8 @@
  * runs here too so the UI never blocks. All `session.run` calls are serialized
  * through a promise lock so discovery and the live render loop never race.
  */
+import { fetchModelBytes } from './model-cache.js';
+
 const INPUT = 'var';
 const OUTPUT = 'img';
 const HAS_SAB = typeof SharedArrayBuffer !== 'undefined';
@@ -77,62 +79,10 @@ function withLock(fn) {
   return run;
 }
 
-let modelUrl = '/models/EndToEndNetwork.onnx';
-
-// Optional second model input: the W-space offset (`w_add`, shape
-// [1, layers, 512]) the model adds to the mapped w before synthesis. When the
-// loaded model declares it, it is fed on every run — zeros by default, or the
-// vector carried by the latest `z` message (tiled across the per-layer axis).
-let wInput = null;
-let wDims = null;
-let wCount = 0;
-let wAdd = null;
-
-function configureIO(s) {
-  const names =
-    (s.inputNames && s.inputNames.length && [...s.inputNames]) ||
-    (s.inputMetadata || []).map((m) => m.name);
-  const others = names.filter((n) => n !== INPUT);
-  wInput = others.includes('w_add') ? 'w_add' : others[0] || null;
-  if (!wInput) {
-    wDims = null;
-    wCount = 0;
-    wAdd = null;
-    return;
-  }
-  const meta = (s.inputMetadata || []).find((m) => m.name === wInput);
-  const shape = meta && meta.shape;
-  wDims =
-    shape && shape.length
-      ? shape.map((d) => (Number.isFinite(d) && d > 0 ? Number(d) : 1))
-      : [1, 512];
-  wCount = wDims.reduce((a, b) => a * b, 1);
-  wAdd = new Float32Array(wCount);
-}
-
-// Copy a supplied W vector into the persistent buffer, tiling a shorter vector
-// across the remaining axis (a single 512-D w reused for every layer).
-function applyW(vec) {
-  if (!wInput || !wAdd || vec == null) return;
-  const src = vec instanceof Float32Array ? vec : Float32Array.from(vec);
-  if (!src.length) return;
-  if (src.length === wCount) {
-    wAdd.set(src);
-  } else if (wCount % src.length === 0) {
-    for (let i = 0; i < wCount; i += src.length) wAdd.set(src, i);
-  }
-}
-
-function wFeed() {
-  if (!wInput || !wAdd) return {};
-  return { [wInput]: new ort.Tensor('float32', wAdd, wDims) };
-}
-
 async function brightnessOfOn(z) {
   const result = await withLock(() =>
     session.run({
       [INPUT]: new ort.Tensor('float32', z, [1, z.length]),
-      ...wFeed(),
     })
   );
   const d = result[OUTPUT].data;
@@ -146,13 +96,12 @@ self.onmessage = (e) => {
   if (msg.type === 'init') {
     init(msg);
   } else if (msg.type === 'z') {
-    if (msg.w) applyW(msg.w);
     latestZ = msg.z;
     latestTanh = !!msg.tanh;
     latestHue = msg.hue || 0;
     if (session && !pumping) pump();
   } else if (msg.type === 'brightness') {
-    discoverBrightness(msg.samples || 48);
+    discoverBrightness(msg.samples || 256);
   } else if (msg.type === 'render-done') {
     if (ackWaiter) {
       const resolve = ackWaiter;
@@ -259,7 +208,17 @@ function runBenchWorker(url, provider, threads) {
 
 async function benchmarkProviders(url, providers) {
   const results = [];
-  postMessage({ type: 'status', text: 'Benchmarking compute providers&hellip;' });
+  const total = providers.reduce(
+    (n, p) => n + (p === 'wasm' ? candidateThreads().length : 1),
+    0
+  );
+  let done = 0;
+  postMessage({
+    type: 'status',
+    phase: 'bench',
+    text: 'Benchmarking compute providers&hellip;',
+    progress: 0,
+  });
   for (const provider of providers) {
     const candidates = provider === 'wasm' ? candidateThreads() : [1];
     for (const threads of candidates) {
@@ -267,10 +226,16 @@ async function benchmarkProviders(url, providers) {
         provider === 'wasm'
           ? `wasm (${threads} thread${threads === 1 ? '' : 's'})`
           : provider;
-      postMessage({ type: 'status', text: `Benchmarking ${label}&hellip;` });
+      postMessage({
+        type: 'status',
+        phase: 'bench',
+        text: `Benchmarking ${label}&hellip;`,
+        progress: total ? done / total : 0,
+      });
       const ms = await runBenchWorker(url, provider, threads);
       const result = { provider, threads, ms };
       results.push(result);
+      done += 1;
       postMessage({ type: 'bench-result', ...result });
     }
   }
@@ -292,12 +257,25 @@ function isValidConfig(config, providers) {
 async function init(msg) {
   const url = msg.url;
   if (!url) {
-    postMessage({ type: 'status', text: 'no model selected' });
+    postMessage({ type: 'status', phase: 'idle', text: 'no model selected' });
     return;
   }
-  modelUrl = url;
+  const label = msg.modelName || 'model';
   const providers =
     Array.isArray(msg.providers) && msg.providers.length ? msg.providers : ['wasm'];
+
+  // Fetch (or read from cache) the model BEFORE benchmarking. The first
+  // benchmark candidate would otherwise be what pulls the file, so the user
+  // would watch "Benchmarking …" while 100 MB streams in the background. Doing
+  // it up front also means every benchmark candidate gets a warm cache hit.
+  await fetchModelBytes(url, (loaded, total, cached) => {
+    postMessage({
+      type: 'status',
+      phase: 'download',
+      text: cached ? 'Loading model from cache&hellip;' : 'Downloading model&hellip;',
+      progress: total ? loaded / total : undefined,
+    });
+  });
 
   let config;
   if (typeof msg.providerOverride === 'string' && msg.providerOverride) {
@@ -319,11 +297,10 @@ async function init(msg) {
   await loadOrt(config.provider);
   if (config.provider === 'wasm') ort.env.wasm.numThreads = config.threads;
 
-  const label = msg.modelName || 'model';
-  postMessage({ type: 'status', text: `Loading ${label}&hellip;` });
+  postMessage({ type: 'status', phase: 'load', text: `Loading ${label}&hellip;` });
   try {
-    session = await withLock(() =>
-      ort.InferenceSession.create(url, {
+    session = await withLock(async () =>
+      ort.InferenceSession.create(await fetchModelBytes(url), {
         executionProviders: [config.provider],
         graphOptimizationLevel: 'all',
       })
@@ -332,11 +309,11 @@ async function init(msg) {
     console.error(err);
     postMessage({
       type: 'status',
+      phase: 'idle',
       text: `Failed to load ${label}: ${err && err.message ? err.message : err}`,
     });
     return;
   }
-  configureIO(session);
   dim = readDim(session);
   postMessage({
     type: 'ready',
@@ -345,10 +322,6 @@ async function init(msg) {
     threads: config.provider === 'wasm' ? ort.env.wasm.numThreads : 0,
     multithreaded: HAS_SAB,
     bench: lastBench,
-    hasW: !!wInput,
-    wInput,
-    wShape: wDims ? wDims.slice() : null,
-    wCount,
   });
 }
 
@@ -364,7 +337,6 @@ async function pump() {
     const out = await withLock(() =>
       session.run({
         [INPUT]: new ort.Tensor('float32', z, [1, dim]),
-        ...wFeed(),
       })
     );
     const tensor = out[OUTPUT];
@@ -451,9 +423,14 @@ function hueShiftBytes(bytes, shift, WW, HH) {
   }
 }
 
-async function discoverBrightness(n = 48) {
+async function discoverBrightness(n = 256) {
   if (!session) return;
-  postMessage({ type: 'status', text: 'Discovering brightness direction&hellip;' });
+  postMessage({
+    type: 'status',
+    phase: 'sample',
+    text: 'Sampling brightness direction&hellip;',
+    progress: 0,
+  });
 
   const Z = new Float32Array(n * dim);
   for (let i = 0; i < Z.length; i++) {
@@ -472,7 +449,12 @@ async function discoverBrightness(n = 48) {
   for (let i = 0; i < n; i++) {
     b[i] = await brightnessOfOn(Z.subarray(i * dim, (i + 1) * dim));
     if ((i + 1) % 8 === 0) {
-      postMessage({ type: 'status', text: `Brightness ${i + 1}/${n}&hellip;` });
+      postMessage({
+        type: 'status',
+        phase: 'sample',
+        text: `Brightness ${i + 1}/${n}&hellip;`,
+        progress: (i + 1) / n,
+      });
     }
   }
 
@@ -514,5 +496,5 @@ async function discoverBrightness(n = 48) {
     ms: performance.now() - t0,
     samples: n,
   });
-  postMessage({ type: 'status', text: `Brightness ready (${n} samples)` });
+  postMessage({ type: 'status', phase: 'idle', text: `Brightness ready (${n} samples)` });
 }

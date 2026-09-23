@@ -1,15 +1,19 @@
 /**
  * Power-spectrum display for the right panel.
  *
- * The magnitude spectrum is resampled onto pixel columns spaced logarithmically
- * in frequency (equal width per semitone — exactly how the keys of a piano are
- * laid out), converted to power (10·log10(mag²)), and drawn as a single clean
- * white curve with faint octave gridlines at the C keys.
+ * The magnitude spectrum is resampled onto 2048 sample points spaced
+ * logarithmically in frequency (equal width per semitone — exactly how the keys
+ * of a piano are laid out), converted to power (10·log10(mag²)), and drawn as a
+ * single clean white curve with faint octave gridlines at the C keys. The sample
+ * count is fixed, so the curve resolution does not depend on the canvas width.
  *
  * The input is the A-weighted, `Smoothing Factor`-smoothed spectrum from
  * `main.js computeLatent`. Because it is already A-weighted, this view does not
- * weight it again, and it draws the data raw: no attack/release envelope, no
- * auto-gain averaging, no blur. The brightness and pulse filters shape the same
+ * weight it again, and it draws the data raw: no attack/release envelope and no
+ * auto-gain averaging (the signal is already time-smoothed upstream by
+ * `Smoothing Factor`). A short spatial blur over the pixel columns is applied
+ * only to what is drawn, to remove the stair-steps the max-per-column resample
+ * produces. The brightness and pulse filters shape the same
  * A-weighted spectrum BEFORE the display smoothing, so they track their bands
  * immediately while the curve itself stays smoothed.
  */
@@ -23,8 +27,28 @@ const F_MAX = 18000;
 // ~256 there), so this reference stays valid across FFT sizes. Typical signals
 // sit well below it — use the Preamp Gain slider, or lower REF_MAG, to bring the
 // trace up.
-export const REF_MAG = 128; // full-scale sine magnitude (see buildWInjection loudness)
+export const REF_MAG = 128; // full-scale sine magnitude (see buildPulseInjection loudness)
 const REF_DB = -60; // display floor (dB below REF_MAG)
+
+// Spatial smoothing of the drawn curve. Each display sample takes the max
+// magnitude in its log-spaced frequency slice, which leaves stair-steps where a
+// slice spans a single FFT bin. A short Gaussian blur over the samples rounds
+// those off while keeping peaks and dips where they are. This is SPATIAL only:
+// the signal is already smoothed over time upstream by `Smoothing Factor`, so no
+// attack/release is added here.
+const SAMPLES = 4096; // display sample points across the log-frequency axis
+const SMOOTH_RADIUS = 30; // sample points on each side of the kernel centre
+const SMOOTH_SIGMA = 30; // sample points
+const SMOOTH_KERNEL = (() => {
+  const k = [];
+  let sum = 0;
+  for (let i = -SMOOTH_RADIUS; i <= SMOOTH_RADIUS; i++) {
+    const v = Math.exp(-(i * i) / (2 * SMOOTH_SIGMA * SMOOTH_SIGMA));
+    k.push(v);
+    sum += v;
+  }
+  return k.map((v) => v / sum);
+})();
 
 /** A-weighting curve in dB (0 dB at 1 kHz). */
 export function aWeightDb(f) {
@@ -41,8 +65,12 @@ export class SpectrumView {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
-    // Per-pixel-column displayed height (0..1), drawn each frame.
-    this.level = new Float32Array(0);
+    // Display sample points (0..1 height) across the log-frequency axis, drawn
+    // each frame. `smooth` is the spatially blurred copy the fill and curve are
+    // actually drawn from. Both are a fixed SAMPLES long, independent of the
+    // canvas pixel width.
+    this.level = new Float32Array(SAMPLES);
+    this.smooth = new Float32Array(SAMPLES);
 
     // Per-source band filters (brightness, pulse, motion), each a Gaussian in
     // log-frequency space visualized as a draggable point with Gaussian decay.
@@ -66,6 +94,12 @@ export class SpectrumView {
     // Called as onFilterChange(id, freq|null, widthOct|null, react|null) from
     // interactions. null args leave that axis unchanged.
     this.onFilterChange = null;
+
+    // Transient highlight: `flash(ids)` makes the named handles blink once
+    // (used when the matching control tab is selected).
+    this._flashIds = new Set();
+    this._flashStart = 0;
+    this._flashUntil = 0;
 
     // Frequency-axis mapping of the most recent frame, reused by handlers.
     this._logMin = Math.log(F_MIN);
@@ -138,6 +172,15 @@ export class SpectrumView {
     }, { passive: false });
   }
 
+  /** Blink the given filter handles once (a single decaying pulse). */
+  flash(ids) {
+    if (!ids || !ids.length) return;
+    const now = performance.now();
+    this._flashIds = new Set(ids);
+    this._flashStart = now;
+    this._flashUntil = now + 620;
+  }
+
   /**
    * Feed the A-weighted, smoothed magnitude spectrum (linear, one bin per FFT
    * frequency) shared with the latent/LSD path. `filters` maps a filter id to
@@ -164,7 +207,6 @@ export class SpectrumView {
     if (canvas.width !== w || canvas.height !== h) {
       canvas.width = w;
       canvas.height = h;
-      this.level = new Float32Array(w);
     }
 
     const n = mags.length - 1; // highest bin index
@@ -181,26 +223,48 @@ export class SpectrumView {
     // drawn at its absolute level with no auto-gain of any kind.
     const ref2 = REF_MAG * REF_MAG;
 
-    // Resample: max magnitude per log-spaced column -> dB (already A-weighted
-    // upstream, so no perceptual weighting is applied here).
+    // Resample: max magnitude per log-spaced sample -> dB (already A-weighted
+    // upstream, so no perceptual weighting is applied here). Always SAMPLES
+    // points, independent of the canvas pixel width.
     const level = this.level;
-    for (let x = 0; x < w; x++) {
-      const f0 = Math.exp(logMin + (logSpan * x) / w);
-      const f1 = Math.exp(logMin + (logSpan * (x + 1)) / w);
+    for (let i = 0; i < SAMPLES; i++) {
+      const f0 = Math.exp(logMin + (logSpan * i) / (SAMPLES - 1));
+      const f1 = Math.exp(logMin + (logSpan * (i + 1)) / (SAMPLES - 1));
       let b0 = Math.max(1, Math.floor((f0 / nyq) * n));
       let b1 = Math.min(n, Math.max(b0 + 1, Math.ceil((f1 / nyq) * n)));
       let m = 0;
       for (let b = b0; b <= b1; b++) if (mags[b] > m) m = mags[b];
       const db = 10 * Math.log10((m * m) / ref2 + 1e-12);
-      level[x] = Math.min(1, Math.max(0, (db - REF_DB) / -REF_DB));
+      level[i] = Math.min(1, Math.max(0, (db - REF_DB) / -REF_DB));
     }
 
+    this.smoothLevel();
     this.draw(w, h, dpr);
+  }
+
+  // Gaussian-blur the per-sample level into `this.smooth` (edge-clamped), which
+  // is what the fill and curve are drawn from.
+  smoothLevel() {
+    const src = this.level;
+    const w = src.length;
+    if (this.smooth.length !== w) this.smooth = new Float32Array(w);
+    const dst = this.smooth;
+    const r = SMOOTH_RADIUS;
+    const kernel = SMOOTH_KERNEL;
+    const last = w - 1;
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let i = -r; i <= r; i++) {
+        const j = x + i < 0 ? 0 : x + i > last ? last : x + i;
+        acc += src[j] * kernel[i + r];
+      }
+      dst[x] = acc;
+    }
   }
 
   draw(w, h, dpr) {
     const g = this.ctx;
-    const level = this.level;
+    const level = this.smooth;
     g.clearRect(0, 0, w, h);
 
     const padTop = 5 * dpr;
@@ -217,6 +281,7 @@ export class SpectrumView {
     // retunes the react amount.
     for (const f of this.filters) {
       if (f.freq == null || f.freq <= 0) continue;
+      const now = performance.now();
       const fc = Math.min(Math.max(f.freq, F_MIN), this._fMax);
       const cx = (w * (Math.log(fc) - this._logMin)) / this._logSpan;
       const sigma = Math.max(f.widthOct, 0.05);
@@ -255,12 +320,40 @@ export class SpectrumView {
       g.strokeStyle = f.ringColor;
       g.lineWidth = Math.max(1, Math.round(dpr));
       g.stroke();
+
+      // One-shot blink, triggered by selecting the matching control tab.
+      if (this._flashIds.has(f.id)) {
+        const dur = this._flashUntil - this._flashStart;
+        const progress = dur > 0 ? (now - this._flashStart) / dur : 1;
+        if (progress >= 1) {
+          this._flashIds.delete(f.id);
+        } else {
+          const k = Math.sin(Math.PI * Math.min(1, Math.max(0, progress)));
+          g.save();
+          g.globalAlpha = k;
+          g.beginPath();
+          g.arc(cx, dotY, (8 + 9 * (1 - k)) * dpr, 0, Math.PI * 2);
+          g.strokeStyle = f.color;
+          g.lineWidth = Math.max(1.5, 2 * dpr);
+          g.stroke();
+          g.beginPath();
+          g.arc(cx, dotY, 6 * dpr, 0, Math.PI * 2);
+          g.fillStyle = f.color;
+          g.fill();
+          g.restore();
+        }
+      }
     }
+
+    // Map sample index -> pixel column. `level` holds SAMPLES points across the
+    // same log-frequency span the curve covers.
+    const n = level.length;
+    const xAt = (i) => (n <= 1 ? 0 : (i / (n - 1)) * (w - 1));
 
     // Filled area under the curve, fading toward the bottom edge.
     g.beginPath();
     g.moveTo(0, baseY);
-    for (let x = 0; x < w; x++) g.lineTo(x, baseY - level[x] * plotH);
+    for (let i = 0; i < n; i++) g.lineTo(xAt(i), baseY - level[i] * plotH);
     g.lineTo(w - 1, baseY);
     g.closePath();
     const grad = g.createLinearGradient(0, padTop, 0, baseY);
@@ -277,10 +370,11 @@ export class SpectrumView {
     let started = false;
     let px = 0;
     let py = 0;
-    for (let x = 0; x < w; x++) {
-      const y = baseY - level[x] * plotH;
+    for (let i = 0; i < n; i++) {
+      const x = xAt(i);
+      const y = baseY - level[i] * plotH;
       if (!started) {
-        if (level[x] < 1e-3) continue;
+        if (level[i] < 1e-3) continue;
         g.moveTo(x, y);
         px = x;
         py = y;

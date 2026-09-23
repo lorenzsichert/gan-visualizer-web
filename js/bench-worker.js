@@ -21,6 +21,8 @@
  * The parent picks the fastest configuration. This worker terminates itself
  * after posting the result.
  */
+import { fetchModelBytes } from './model-cache.js';
+
 function moduleUrl(provider) {
   return provider === 'wasm'
     ? '/lib/ort-wasm/ort.wasm.min.mjs'
@@ -50,7 +52,7 @@ self.onmessage = async (e) => {
     ort.env.logLevel = 'warning';
     ort.env.wasm.numThreads = threads;
 
-    const session = await ort.InferenceSession.create(msg.url, {
+    const session = await ort.InferenceSession.create(await fetchModelBytes(msg.url), {
       executionProviders: [provider],
       graphOptimizationLevel: 'all',
     });
@@ -59,21 +61,6 @@ self.onmessage = async (e) => {
     const z = new Float32Array(dim);
     for (let i = 0; i < dim; i++) z[i] = Math.random() * 2 - 1;
     const feeds = { var: new ort.Tensor('float32', z, [1, dim]) };
-    // Feed zeros for any extra required input (e.g. the W offset `w_add`) so
-    // multi-input models can still be benchmarked.
-    const names =
-      (session.inputNames && session.inputNames.length && [...session.inputNames]) ||
-      (session.inputMetadata || []).map((m) => m.name);
-    for (const name of names) {
-      if (name === 'var') continue;
-      const shape = (session.inputMetadata || []).find((m) => m.name === name)?.shape;
-      const dims =
-        shape && shape.length
-          ? shape.map((d) => (Number.isFinite(d) && d > 0 ? Number(d) : 1))
-          : [1, dim];
-      const count = dims.reduce((a, b) => a * b, 1);
-      feeds[name] = new ort.Tensor('float32', new Float32Array(count), dims);
-    }
 
     const warmup = msg.warmup ?? 2;
     for (let i = 0; i < warmup; i++) await session.run(feeds);

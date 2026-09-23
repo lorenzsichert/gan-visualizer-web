@@ -7,7 +7,7 @@
  *   - ONNX inference ..... inference worker (off-thread WASM, multi-threaded)
  *   - Rendering .......... this thread (single GPU blit)
  */
-import { SETTINGS, GROUP_ORDER, get } from './settings.js';
+import { SETTINGS, get } from './settings.js';
 import { LSDLatent, randn } from './lsd.js';
 import { AudioPipeline } from './audio.js';
 import { SpectrumView, aWeightDb, REF_MAG } from './spectrum.js';
@@ -28,6 +28,8 @@ const elAudio = document.getElementById('audio');
 const elToast = document.getElementById('bench-toast');
 const elToastRows = document.getElementById('bench-rows');
 const elToastNote = document.getElementById('bench-note');
+const elModelRows = document.getElementById('model-rows');
+const elModelProgress = document.getElementById('model-progress-fill');
 
 // ---------------------------------------------------------------------------
 // Persistent latent state (mirrors GANVisualizer.__init__ / _resize_latent_state)
@@ -71,11 +73,12 @@ const audio = new AudioPipeline();
 const spectrumView = new SpectrumView(document.getElementById('spectrum'));
 let demo = false;
 
-// W-space injection source: the first W_SPECTRUM_DIM spectrum bins, filtered by
-// the blue pulse band in computeLatent (A-weighted, no display smoothing) and
-// smoothed by Pulse Smooth. buildWInjection pushes it straight into W space.
-const W_SPECTRUM_DIM = 512; // model W width
-let pulseSpectrum = new Float32Array(W_SPECTRUM_DIM);
+// Pulse injection source: the first PULSE_DIM spectrum bins, filtered by the
+// blue pulse band in computeLatent (A-weighted, no display smoothing) and
+// smoothed by Pulse Smooth. buildPulseInjection adds it straight into the
+// latent z (see the main loop), not into W space.
+const PULSE_DIM = 512; // number of spectrum bins that drive the pulse
+let pulseSpectrum = new Float32Array(PULSE_DIM);
 // 0 = off, 1 = mirror (sharp tiles), 2 = mirror + blurred side tiles.
 let mirrorMode = 2;
 
@@ -123,43 +126,60 @@ let ready = false;
 // The auto-calibrated compute config is cached so the provider/thread benchmark
 // only runs once per machine/model; `?bench` in the URL forces a fresh one.
 const CONFIG_KEY = 'compute-config';
+const BRIGHTNESS_KEY = 'brightness-dir';
 const OVERRIDE_KEY = 'threads-override';
 const PROVIDER_KEY = 'provider-override';
 const MODEL_KEY = 'model-url';
+const BRIGHTNESS_SAMPLES = 256;
 
-// The model to load. `modelUrl` is a `/models/<file>.onnx` path; null means the
-// discovery list has not been fetched yet.
+// The model to load (a Hub resolve URL); null means the discovery list has not
+// been fetched yet.
 let modelUrl = null;
 let modelList = [];
 
-// Models present at the time this app was written, used only when the dynamic
-// listing is unavailable. Keep in sync with models/.
+// Every model lives on the Hugging Face Hub (none are shipped in the repo —
+// GitHub LFS bandwidth is far too small for 100 MB+ files and they bloat every
+// deploy). js/model-cache.js caches the bytes so each model is downloaded at
+// most once per browser.
+const HF_REPO = 'lorenzsichert/gan-visualizer';
+const HF_BASE = `https://huggingface.co/${HF_REPO}/resolve/main/`;
+const HF_TREE = `https://huggingface.co/api/models/${HF_REPO}/tree/main`;
+
+// Used only when the Hub listing can't be fetched (offline / API hiccup).
 const FALLBACK_MODELS = [
-  'abstract_art_EndToEndNetwork.onnx',
-  'abstract_photo_EndToEndNetwork.onnx',
-  'abstract_photo_big_EndToEndNetwork.onnx',
+  'abstract_art.onnx',
+  'abstract_photo.onnx',
+  'abstract_photo_big.onnx',
+  'flowers_big.onnx',
 ];
 
-// Fetch the directory listing from the dev server (`/api/models`). On static
-// hosting where the endpoint is absent, fall back to the built-in list so the
-// app still boots.
+function hubUrl(name) {
+  return HF_BASE + encodeURIComponent(name);
+}
+
+// List the models from the Hub tree API (names + sizes), falling back to the
+// built-in list so the app still boots when the API is unreachable. Dropping a
+// new .onnx into the Hub repo makes it selectable without touching the app.
 async function discoverModels() {
+  let entries = null;
   try {
-    const res = await fetch('/api/models', { cache: 'no-store' });
+    const res = await fetch(HF_TREE, { cache: 'no-store' });
     if (res.ok) {
       const data = await res.json();
-      if (data && Array.isArray(data.models) && data.models.length) {
-        return data.models;
+      if (Array.isArray(data)) {
+        entries = data
+          .filter((e) => e.type === 'file' && /\.onnx$/i.test(e.path))
+          .map((e) => ({ name: e.path, size: e.size || 0 }));
       }
     }
   } catch (err) {
-    /* No listing endpoint (static hosting) — use the fallback below. */
+    /* Hub unreachable — use the fallback below. */
   }
-  return FALLBACK_MODELS.map((name) => ({
-    name,
-    url: '/models/' + encodeURIComponent(name),
-    size: 0,
-  }));
+  if (!entries || !entries.length) {
+    entries = FALLBACK_MODELS.map((name) => ({ name, size: 0 }));
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  return entries.map((m) => ({ name: m.name, size: m.size, url: hubUrl(m.name) }));
 }
 
 // Human-readable label for a model file: drop the directory, extension and the
@@ -267,31 +287,30 @@ async function bootModels() {
 }
 
 // ---------------------------------------------------------------------------
-// W-space injection (blue pulse filter -> W offset)
+// Pulse injection (blue pulse filter -> latent z offset)
 // ---------------------------------------------------------------------------
-// A model whose ONNX declares a `w_add` input accepts an additive offset in W
-// space. The blue pulse filter is applied to the first W_SPECTRUM_DIM spectrum
-// bins, and those filtered values are pushed straight into W space (see
-// buildWInjection).
-let wScratch = null;
-let lastWMag = 0;
+// The blue pulse filter is applied to the first PULSE_DIM spectrum bins (in
+// computeLatent), and those filtered values are added straight into the latent
+// z every frame, so the band shapes which latent dimensions move.
+let pulseScratch = null;
+let lastPulseMag = 0;
 
-// Push the pulse-filtered spectrum straight into W space. Pulse React scales
-// the whole vector and REF_MAG keeps it calibrated to full scale (a full-scale
-// tone maps to ~Pulse React). Reuses a scratch buffer; the worker gets a copy.
-function buildWInjection() {
-  lastWMag = 0;
-  const n = W_SPECTRUM_DIM;
-  if (!wScratch || wScratch.length !== n) wScratch = new Float32Array(n);
+// Scale the pulse-filtered spectrum by Pulse React; REF_MAG keeps it calibrated
+// to full scale (a full-scale tone maps to ~Pulse React). Reuses a scratch
+// buffer; it is added element-wise into the posted latent.
+function buildPulseInjection() {
+  lastPulseMag = 0;
+  const n = PULSE_DIM;
+  if (!pulseScratch || pulseScratch.length !== n) pulseScratch = new Float32Array(n);
   const gain = get('Pulse React') / REF_MAG;
   let mag = 0;
   for (let i = 0; i < n; i++) {
     const v = pulseSpectrum[i] * gain;
-    wScratch[i] = v;
+    pulseScratch[i] = v;
     if (Math.abs(v) > mag) mag = Math.abs(v);
   }
-  lastWMag = mag;
-  return wScratch;
+  lastPulseMag = mag;
+  return pulseScratch;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,16 +489,26 @@ function loadProviderOverride() {
   return null;
 }
 
+// Compute config and brightness direction are cached per model, so switching
+// back to a model skips both the benchmark and the direction sampling.
+function configKeyFor(url) {
+  return `${CONFIG_KEY}:${url}`;
+}
+
+function brightnessKeyFor(url) {
+  return `${BRIGHTNESS_KEY}:${url}`;
+}
+
 function cachedConfig() {
+  if (!modelUrl) return null;
   try {
-    const data = JSON.parse(localStorage.getItem(CONFIG_KEY) || 'null');
+    const data = JSON.parse(localStorage.getItem(configKeyFor(modelUrl)) || 'null');
     if (
       data &&
       detectProviders().includes(data.provider) &&
       Number.isInteger(data.threads) &&
       data.threads >= 1 &&
-      data.hw === (navigator.hardwareConcurrency || 0) &&
-      data.model === modelUrl
+      data.hw === (navigator.hardwareConcurrency || 0)
     ) {
       return { provider: data.provider, threads: data.threads };
     }
@@ -489,13 +518,36 @@ function cachedConfig() {
   return null;
 }
 
+function loadCachedBrightness() {
+  if (!modelUrl) return null;
+  try {
+    const data = JSON.parse(localStorage.getItem(brightnessKeyFor(modelUrl)) || 'null');
+    if (data && Array.isArray(data.dir) && data.dir.length) {
+      return Float32Array.from(data.dir);
+    }
+  } catch (err) {
+    /* ignore — direction is recomputed */
+  }
+  return null;
+}
+
+function saveCachedBrightness(dir) {
+  if (!modelUrl || !dir || !dir.length) return;
+  try {
+    localStorage.setItem(brightnessKeyFor(modelUrl), JSON.stringify({ dir: Array.from(dir) }));
+  } catch (err) {
+    /* ignore — caching is best-effort */
+  }
+}
+
 function initWorker() {
   worker = new Worker('/js/inference-worker.js', { type: 'module' });
   worker.onmessage = (e) => handleWorker(e.data);
   worker.onerror = (e) => {
-    elStatus.textContent = 'worker error: ' + e.message;
+    setStatus('worker error: ' + e.message, 'idle');
     console.error(e);
   };
+  resetModelProgress();
   const src = modelUrl ? versionedUrl(modelUrl) : undefined;
   if (window.__dbg) window.__dbg.modelSrc = src || null;
   worker.postMessage({
@@ -568,10 +620,9 @@ function restartWorker() {
   elThreads.disabled = true;
   elProvider.classList.remove('on');
   elProvider.disabled = true;
-  elStatus.textContent = 'restarting&hellip;';
+  setStatus('restarting&hellip;', 'idle');
   initWorker();
 }
-
 // ---------------------------------------------------------------------------
 // Compute-benchmark notification
 // ---------------------------------------------------------------------------
@@ -630,16 +681,125 @@ function finishBenchToast(msg) {
   showBenchToast();
 }
 
+// ---------------------------------------------------------------------------
+// Status bar: phase text with a progress fill behind it
+// ---------------------------------------------------------------------------
+const elStatusCell = elStatus.closest('.stat-status');
+
+let statusText = 'initializing&hellip;';
+let statusPhase = 'idle';
+let statusStep = null; // 0..1 reported by the worker for download / bench / sample
+let download = { active: false, done: false }; // drives the toast's model rows
+
+function modelSizeFor(url) {
+  const m = modelList.find((x) => x.url === url);
+  return m ? m.size : 0;
+}
+
+function formatMB(bytes) {
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function renderStatus() {
+  const known = modelSizeFor(modelUrl);
+
+  let frac = null;
+  let indeterminate = false;
+  let text = statusText;
+
+  if (statusPhase === 'download') {
+    if (typeof statusStep === 'number') {
+      frac = Math.min(1, statusStep);
+      const loaded = known ? known * frac : 0;
+      text = `${statusText} ${Math.round(frac * 100)}%${known ? ` (${formatMB(loaded)}/${formatMB(known)})` : ''}`;
+    } else {
+      indeterminate = true;
+    }
+  } else if (statusPhase === 'idle') {
+    frac = null; // nothing in progress — clear the fill
+  } else if (statusPhase === 'bench' || statusPhase === 'sample') {
+    if (typeof statusStep === 'number') frac = statusStep;
+    else indeterminate = true;
+  } else if (statusPhase === 'load') {
+    indeterminate = true;
+  }
+
+  elStatus.innerHTML = text;
+  if (!elStatusCell) return;
+  if (frac == null) elStatusCell.style.removeProperty('--load');
+  else elStatusCell.style.setProperty('--load', String(frac));
+  elStatusCell.classList.toggle('indeterminate', indeterminate);
+  elStatusCell.dataset.phase = statusPhase;
+}
+
+function setStatus(text, phase = 'idle', step = null) {
+  statusText = text;
+  statusPhase = phase;
+  statusStep = step;
+  renderStatus();
+}
+
+function resetModelProgress() {
+  download = { active: false, done: false };
+  updateModelToast();
+  elToastRows.innerHTML = '';
+  showBenchToast();
+  setStatus('starting&hellip;', 'idle');
+}
+
+// ---------------------------------------------------------------------------
+// Model rows in the benchmark toast
+// ---------------------------------------------------------------------------
+function modelRow(key, label, value) {
+  if (!elModelRows) return;
+  let row = elModelRows.querySelector(`[data-key="${key}"]`);
+  if (!row) {
+    row = document.createElement('div');
+    row.className = 'bench-row';
+    row.dataset.key = key;
+    const name = document.createElement('span');
+    name.className = 'bench-name';
+    name.textContent = label;
+    const val = document.createElement('span');
+    val.className = 'bench-ms';
+    row.append(name, val);
+    elModelRows.appendChild(row);
+  }
+  row.querySelector('.bench-ms').textContent = value;
+}
+
+function updateModelToast() {
+  if (!elModelRows) return;
+  const m = modelList.find((x) => x.url === modelUrl);
+  const known = m ? m.size : 0;
+  const frac = download.done
+    ? 1
+    : statusPhase === 'download' && typeof statusStep === 'number'
+      ? statusStep
+      : 0;
+  const loaded = known * frac;
+
+  let status = 'pending';
+  if (download.active) status = 'downloading';
+  else if (download.done) status = 'downloaded';
+
+  const pct = Math.round(frac * 100);
+  modelRow('model', 'Model', m ? m.name : '—');
+  modelRow('size', 'Size', known ? formatMB(known) : '—');
+  modelRow('source', 'Source', 'Hugging Face');
+  modelRow('status', 'Status', status);
+  modelRow('loaded', 'Loaded', known ? `${pct}% · ${formatMB(loaded)}` : `${pct}%`);
+  if (elModelProgress) elModelProgress.style.width = `${pct}%`;
+}
+
 function handleWorker(msg) {
   switch (msg.type) {
     case 'ready': {
       ready = true;
       window.__dbg.ready = true;
       initLatentState(msg.dim || DIM);
-      elStatus.textContent = 'model ready';
+      setStatus('model ready', 'idle');
       window.__dbg.bench = msg.bench;
-      window.__dbg.hasW = !!msg.hasW;
-      window.__dbg.wCount = msg.wCount || 0;
       // The threads dropdown only applies to the WASM provider; show the
       // calibrated provider in its own dropdown.
       const isWasm = msg.provider === 'wasm';
@@ -651,17 +811,16 @@ function handleWorker(msg) {
         elProvider.classList.add('on');
         elProvider.disabled = false;
       }
-      // Persist the auto-calibrated config (never a manual override) so the
-      // next load can skip the benchmark entirely.
+      // Persist the auto-calibrated config (never a manual override) per model,
+      // so the next load of this model can skip the benchmark entirely.
       if (msg.bench && !msg.bench.manual && msg.bench.results) {
         try {
           localStorage.setItem(
-            CONFIG_KEY,
+            configKeyFor(modelUrl),
             JSON.stringify({
               provider: msg.bench.provider,
               threads: msg.bench.threads,
               hw: navigator.hardwareConcurrency || 0,
-              model: modelUrl,
             })
           );
         } catch (err) {
@@ -669,8 +828,16 @@ function handleWorker(msg) {
         }
       }
       finishBenchToast(msg);
-      // Background brightness-direction discovery (doesn't block rendering).
-      worker.postMessage({ type: 'brightness', samples: 48 });
+      // Brightness-direction discovery (cached per model, so it only runs the
+      // first time a model is used; it never blocks rendering).
+      const cachedDir = loadCachedBrightness();
+      if (cachedDir) {
+        brightnessDir = cachedDir;
+        setStatus('brightness direction cached', 'idle');
+      } else {
+        brightnessDir = null;
+        worker.postMessage({ type: 'brightness', samples: BRIGHTNESS_SAMPLES });
+      }
       // Generate model cover thumbnails once the live model is up, so the
       // cover work never delays the first frame.
       if (!coversRequested) {
@@ -679,9 +846,22 @@ function handleWorker(msg) {
       }
       break;
     }
-    case 'status':
-      elStatus.innerHTML = msg.text;
+    case 'status': {
+      const wasDownload = statusPhase === 'download';
+      statusPhase = msg.phase || 'idle';
+      statusText = msg.text;
+      statusStep = typeof msg.progress === 'number' ? msg.progress : null;
+      if (statusPhase === 'download') {
+        download.active = true;
+        showBenchToast();
+      } else if (wasDownload) {
+        download.active = false;
+        download.done = true;
+      }
+      updateModelToast();
+      renderStatus();
       break;
+    }
     case 'bench-result':
       addBenchRow(msg.provider, msg.threads, msg.ms);
       break;
@@ -692,8 +872,10 @@ function handleWorker(msg) {
       worker.postMessage({ type: 'render-done' });
       break;
     case 'brightness':
-      brightnessDir = msg.dir;
-      elStatus.textContent = `brightness ready (${msg.samples} samples)`;
+      brightnessDir =
+        msg.dir instanceof Float32Array ? msg.dir : Float32Array.from(msg.dir || []);
+      saveCachedBrightness(brightnessDir);
+      setStatus(`brightness ready (${msg.samples} samples)`, 'idle');
       break;
   }
 }
@@ -883,7 +1065,7 @@ function computeLatent(dt, nowSec) {
   // their center frequency, decaying smoothly to both sides. Motion reacts to
   // flux; brightness and the blue pulse react to A-weighted magnitude WITHOUT
   // the display smoothing, so they follow the band immediately. The pulse
-  // filter's per-bin output is pushed into W space (see buildWInjection).
+  // filter's per-bin output is added to the latent z (see buildPulseInjection).
   const bfFreq = Math.max(get('Brightness Freq'), 1);
   const bfWidth = Math.max(get('Brightness Width'), 0.05);
   const bfNorm = 1 / (2 * bfWidth * bfWidth);
@@ -904,12 +1086,12 @@ function computeLatent(dt, nowSec) {
     if (v > lowPassBright) lowPassBright = v;
   }
 
-  // Blue pulse filter, applied per bin to the first W_SPECTRUM_DIM bins of the
-  // A-weighted raw spectrum (no display smoothing). These become the W-space
-  // injection directly, so the band shapes which W dimensions move. Pulse
+  // Blue pulse filter, applied per bin to the first PULSE_DIM bins of the
+  // A-weighted raw spectrum (no display smoothing). These become the z-space
+  // injection directly, so the band shapes which latent dimensions move. Pulse
   // Smooth EMA (60 fps-normalized, matching the LSD EMAs) glides the vector.
   const pulsePs = Math.pow(get('Pulse Smooth'), 60 * dt);
-  for (let i = 0; i < W_SPECTRUM_DIM && i < BINS; i++) {
+  for (let i = 0; i < PULSE_DIM && i < BINS; i++) {
     const f = (i * sr) / FFT_SIZE;
     const d = Math.log2(f / pfFreq);
     const w = Math.exp(-d * d * pfNorm);
@@ -947,7 +1129,7 @@ function computeLatent(dt, nowSec) {
 
   // --- LSD latent modulation ---
   const lz = lsd.step({
-    pulseAmp: 0, // the blue pulse filter drives the W-space injection, not the latent
+    pulseAmp: 0, // the blue pulse filter is added to the latent directly (buildPulseInjection), not via the LSD pulse path
     motionAmp: lowPass,
     music: audioNoise,
     pulseMode: get('Pulse Mode'),
@@ -985,12 +1167,14 @@ function loop(now) {
 
   if (ready && lsd) {
     const z = computeLatent(dt, nowSec);
-    const w = buildWInjection();
+    // Add the blue pulse filter's output to the latent (z) space. Tiled if the
+    // latent is longer than the pulse vector.
+    const pulse = buildPulseInjection();
+    for (let i = 0; i < z.length; i++) z[i] += pulse[i % pulse.length];
     // Latest-wins: post every frame; the worker drops stale work.
     worker.postMessage({
       type: 'z',
       z,
-      w,
       tanh: get('Tanh Output') !== 0,
       hue: thisHue,
     });
@@ -1004,7 +1188,7 @@ function loop(now) {
     window.__dbg.audioActive = audio.active;
     window.__dbg.demo = demo;
     window.__dbg.workletMsgs = audio.msgCount;
-    window.__dbg.wInj = +lastWMag.toFixed(4);
+    window.__dbg.pulseInj = +lastPulseMag.toFixed(4);
   }
 
   // Panel spectrum display: the SAME A-weighted, smoothed spectrum that drives
@@ -1039,65 +1223,137 @@ function loop(now) {
 // ---------------------------------------------------------------------------
 // UI setup
 // ---------------------------------------------------------------------------
-function setStatus(text, cls) {
-  elStatus.textContent = text;
-  if (cls) elStatus.classList.add(cls);
+// The panel settings split into tabs below the spectrum. Each tab button is
+// tinted with the same color as its draggable band filter on the spectrum
+// (pulse blue, brightness white, motion yellow); "General" has no spectrum band
+// so it keeps the amber signal accent. Every tab is built once (sliders stay in
+// the DOM) and switching only toggles visibility, so external sync via
+// `syncSettingUI` keeps working regardless of which tab is showing.
+const TAB_KEY = 'control-tab';
+const CONTROL_TABS = [
+  { id: 'general', label: 'General', color: '#e9a13b', soft: 'rgba(233, 161, 59, 0.16)' },
+  { id: 'motion', label: 'Motion', color: '#ffd966', soft: 'rgba(255, 217, 102, 0.16)' },
+  { id: 'pulse', label: 'Pulse', color: '#53c1f1', soft: 'rgba(83, 193, 241, 0.16)' },
+  { id: 'brightness', label: 'Brightness', color: '#ffffff', soft: 'rgba(255, 255, 255, 0.14)' },
+];
+
+// Which spectrum filter handles blink when a tab is selected. General has no
+// band of its own, so it blinks all three.
+const TAB_FILTERS = {
+  general: ['pulse', 'brightness', 'motion'],
+  motion: ['motion'],
+  pulse: ['pulse'],
+  brightness: ['brightness'],
+};
+
+// Which tab a setting belongs to, keyed off its name prefix (the settings
+// groups predate this split and lump Brightness in with Pulse).
+function tabForSetting(name) {
+  if (name.startsWith('Motion ')) return 'motion';
+  if (name.startsWith('Pulse ')) return 'pulse';
+  if (name.startsWith('Brightness ')) return 'brightness';
+  return 'general';
+}
+
+function buildSliderRow(name, def) {
+  const row = document.createElement('div');
+  row.className = 'slider';
+
+  const label = document.createElement('div');
+  label.className = 'label';
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'name';
+  nameSpan.textContent = name;
+  const valSpan = document.createElement('span');
+  valSpan.className = 'val';
+  valSpan.textContent = def.dec ? def.value.toFixed(def.dec) : def.value;
+  label.append(nameSpan, valSpan);
+
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.min = def.min;
+  input.max = def.max;
+  input.step = def.step;
+  input.value = def.value;
+  const setVal = () => {
+    valSpan.textContent = def.dec ? def.value.toFixed(def.dec) : def.value;
+  };
+  // Keep UI references so external changes (e.g. dragging the filter point on
+  // the spectrum) can sync the slider position and label.
+  def.uiInput = input;
+  def.uiVal = setVal;
+  input.addEventListener('input', () => {
+    def.value = parseFloat(input.value);
+    setVal();
+  });
+
+  row.append(label, input);
+  return row;
 }
 
 function buildSliders() {
   const container = document.getElementById('sliders');
-  for (const group of GROUP_ORDER) {
-    const visible = Object.values(SETTINGS).filter(
-      (def) => !def.hidden && def.group === group
-    );
-    if (!visible.length) continue;
+  container.innerHTML = '';
 
-    const section = document.createElement('div');
-    const title = document.createElement('div');
-    title.className = 'group-title';
-    title.textContent = group;
-    section.appendChild(title);
+  const tabbar = document.createElement('div');
+  tabbar.className = 'tabs';
+  tabbar.setAttribute('role', 'tablist');
 
-    for (const [name, def] of Object.entries(SETTINGS)) {
-      if (def.hidden) continue;
-      if (def.group !== group) continue;
+  const panels = document.createElement('div');
+  panels.className = 'tab-panels';
 
-      const row = document.createElement('div');
-      row.className = 'slider';
+  const buttons = new Map();
+  const panes = new Map();
 
-      const label = document.createElement('div');
-      label.className = 'label';
-      const nameSpan = document.createElement('span');
-      nameSpan.className = 'name';
-      nameSpan.textContent = name;
-      const valSpan = document.createElement('span');
-      valSpan.className = 'val';
-      valSpan.textContent = def.dec ? def.value.toFixed(def.dec) : def.value;
-      label.append(nameSpan, valSpan);
-
-      const input = document.createElement('input');
-      input.type = 'range';
-      input.min = def.min;
-      input.max = def.max;
-      input.step = def.step;
-      input.value = def.value;
-      const setVal = () => {
-        valSpan.textContent = def.dec ? def.value.toFixed(def.dec) : def.value;
-      };
-      // Keep UI references so external changes (e.g. dragging the filter
-      // point on the spectrum) can sync the slider position and label.
-      def.uiInput = input;
-      def.uiVal = setVal;
-      input.addEventListener('input', () => {
-        def.value = parseFloat(input.value);
-        setVal();
-      });
-
-      row.append(label, input);
-      section.appendChild(row);
+  const activate = (id, blink) => {
+    for (const [tid, btn] of buttons) {
+      const on = tid === id;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
     }
-    container.appendChild(section);
+    for (const [tid, pane] of panes) pane.classList.toggle('active', tid === id);
+    try {
+      localStorage.setItem(TAB_KEY, id);
+    } catch (err) {
+      /* storage unavailable */
+    }
+    if (blink) spectrumView.flash(TAB_FILTERS[id] || []);
+  };
+
+  for (const tab of CONTROL_TABS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tab';
+    btn.textContent = tab.label;
+    btn.style.setProperty('--tab-color', tab.color);
+    btn.style.setProperty('--tab-soft', tab.soft);
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-selected', 'false');
+    btn.addEventListener('click', () => activate(tab.id, true));
+    buttons.set(tab.id, btn);
+    tabbar.appendChild(btn);
+
+    const pane = document.createElement('div');
+    pane.className = 'tab-panel';
+    pane.setAttribute('role', 'tabpanel');
+    pane.dataset.tab = tab.id;
+    for (const [name, def] of Object.entries(SETTINGS)) {
+      if (def.hidden || tabForSetting(name) !== tab.id) continue;
+      pane.appendChild(buildSliderRow(name, def));
+    }
+    panes.set(tab.id, pane);
+    panels.appendChild(pane);
   }
+
+  container.append(tabbar, panels);
+
+  let saved = null;
+  try {
+    saved = localStorage.getItem(TAB_KEY);
+  } catch (err) {
+    /* storage unavailable */
+  }
+  activate(buttons.has(saved) ? saved : CONTROL_TABS[0].id);
 }
 
 function resize() {

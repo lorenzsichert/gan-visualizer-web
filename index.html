@@ -4,8 +4,16 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GAN Audio Visualizer</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0b0d'/><rect x='3.5' y='3.5' width='9' height='9' fill='none' stroke='%23e9a13b' stroke-width='1.5'/></svg>" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%230a0b0d'/><rect x='3.5' y='3.5' width='9' height='9' fill='none' stroke='%23e8eaee' stroke-width='1.5'/></svg>" />
   <link rel="stylesheet" href="/style.css" />
+
+  <!-- Vercel Web Analytics: anonymous page views/visitors.
+       Enable it under Project → Analytics in the Vercel dashboard, then redeploy.
+       The endpoint only exists on Vercel deployments; local dev returns 404. -->
+  <script>
+    window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+  </script>
+  <script defer src="/_vercel/insights/script.js"></script>
 </head>
 <body>
   <canvas id="view"></canvas>
@@ -22,25 +30,6 @@
     </div>
 
     <div class="panel-body" id="panel-body">
-      <section class="selectors">
-        <div class="box-title">Generator</div>
-        <div id="model-gallery" class="model-gallery" role="radiogroup" aria-label="Generator model"></div>
-        <div class="selector-grid">
-          <div class="selector">
-            <span class="stat-label">Compute</span>
-            <select id="provider" class="stat-value" title="Inference execution provider (WebGPU / WebNN / WASM). Shows the benchmarked best; picking one overrides it (the model reloads when changed).">
-              <option value="auto">Auto</option>
-            </select>
-          </div>
-          <div class="selector">
-            <span class="stat-label">Threads</span>
-            <select id="threads" class="stat-value" title="WASM inference threads. Shows the current count; picking a value overrides the benchmarked best (the model reloads when changed).">
-              <option value="auto">Auto</option>
-            </select>
-          </div>
-        </div>
-      </section>
-
       <section class="stats">
         <div class="stat stat-status">
           <span class="stat-label">Status</span>
@@ -60,6 +49,21 @@
         </div>
       </section>
 
+      <div class="selector-grid">
+        <div class="selector">
+          <span class="stat-label">Compute</span>
+          <select id="provider" class="stat-value" title="Inference execution provider (WebGPU / WebNN / WASM). Shows the benchmarked best; picking one overrides it (the model reloads when changed).">
+            <option value="auto">Auto</option>
+          </select>
+        </div>
+        <div class="selector">
+          <span class="stat-label">Threads</span>
+          <select id="threads" class="stat-value" title="WASM inference threads. Shows the current count; picking a value overrides the benchmarked best (the model reloads when changed).">
+            <option value="auto">Auto</option>
+          </select>
+        </div>
+      </div>
+
       <section class="actions">
         <button id="btn-mic" class="btn primary">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -74,6 +78,16 @@
             <path d="M2 12h3l2-7 4 14 3-10 2 6 2-3h4"/>
           </svg>
           <span>Demo signal</span>
+        </button>
+        <button id="btn-pause" class="btn" title="Pause the visualizer; audio keeps running" aria-pressed="false">
+          <svg class="icon-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="6.5" y="4.5" width="3.5" height="15" rx="1.2"/>
+            <rect x="14" y="4.5" width="3.5" height="15" rx="1.2"/>
+          </svg>
+          <svg class="icon-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M7 4.5l12 7.5-12 7.5z"/>
+          </svg>
+          <span>Pause</span>
         </button>
         <button id="btn-fullscreen" class="btn" title="Go fullscreen">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -96,11 +110,41 @@
         </button>
       </section>
 
-      <section class="viz">
-        <canvas id="spectrum" title="A-weighted power spectrum. Drag a colored point to retune its band: horizontal = center frequency, vertical = how strongly it reacts. Wheel adjusts band width. The blue point's loudest frequency depth-weights the z-space (latent) injection."></canvas>
-      </section>
+      <div class="spectrum-row">
+        <div class="preamp-col">
+          <div id="preamp" class="preamp" role="slider" tabindex="0"
+               aria-label="Preamp Gain" aria-orientation="vertical"
+               aria-valuemin="-60" aria-valuemax="60" aria-valuenow="-12" aria-valuetext="-12.0 dB">
+            <div class="preamp-track">
+              <div class="preamp-fill"></div>
+            </div>
+            <div class="preamp-readout" aria-hidden="true">
+              <span class="preamp-key">Preamp</span>
+              <span class="preamp-db">-12.0 dB</span>
+            </div>
+          </div>
+          <div id="mic-indicator" class="mic-indicator off" role="img"
+               aria-label="Microphone off" title="Microphone off">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="2.5" width="6" height="11.5" rx="3"/>
+              <path d="M5.5 10.5a6.5 6.5 0 0 0 13 0"/>
+              <path d="M12 17v4.5"/>
+              <path class="mic-slash" d="M4 3l16 18"/>
+            </svg>
+          </div>
+        </div>
+        <section class="viz">
+          <canvas id="spectrum" title="A-weighted power spectrum. Drag a colored point to retune its band: horizontal = center frequency, vertical = how strongly it reacts. Wheel adjusts band width. The blue point's loudest frequency depth-weights the z-space (latent) injection."></canvas>
+        </section>
+      </div>
 
       <div id="sliders"></div>
+
+      <section class="selectors">
+        <div class="box-title">Generator</div>
+        <div id="model-gallery" class="model-gallery" role="radiogroup" aria-label="Generator model"></div>
+      </section>
     </div>
   </aside>
 

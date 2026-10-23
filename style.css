@@ -1,6 +1,6 @@
 /* ---------------------------------------------------------------------------
    GAN Audio Visualizer — studio instrument UI
-   Neutral graphite surfaces, hairline borders, single amber signal accent.
+   Neutral graphite surfaces, hairline borders, single white signal accent.
 --------------------------------------------------------------------------- */
 :root {
   --bg: #0a0b0d;
@@ -14,9 +14,9 @@
   --text-muted: #9aa1ab;
   --text-faint: #60666f;
 
-  --accent: #e9a13b;
-  --accent-soft: rgba(233, 161, 59, 0.14);
-  --accent-line: rgba(233, 161, 59, 0.45);
+  --accent: #e8eaee;
+  --accent-soft: rgba(255, 255, 255, 0.12);
+  --accent-line: rgba(255, 255, 255, 0.40);
   --danger: #e0604f;
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto,
@@ -151,10 +151,18 @@ body.pointer-idle #panel-open { opacity: 0; pointer-events: none; }
 .panel-body::-webkit-scrollbar-track { background: transparent; }
 
 /* ---------- Spectrum ---------- */
-.viz {
+.spectrum-row {
   flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.viz {
+  flex: 1 1 auto;
+  min-width: 0;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--surface-2);
   overflow: hidden;
 }
@@ -169,15 +177,152 @@ body.pointer-idle #panel-open { opacity: 0; pointer-events: none; }
 
 .viz canvas:active { cursor: grabbing; }
 
+/* Preamp gain: thin vertical volume pill beside the spectrum card, height-matched
+   to the canvas. The hit area is wider than the visible track. */
+.preamp {
+  --pos: 40%;
+  position: relative;
+  flex: none;
+  width: 14px;
+  height: 90px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  touch-action: none;
+  outline: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: opacity 0.4s ease-in-out;
+}
+
+/* Preamp + mic status stacked left of the spectrum. */
+.preamp-col {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.mic-indicator {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  transition: color 0.4s ease-in-out, opacity 0.4s ease-in-out;
+}
+
+.mic-indicator svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* The slash is always present but fully hidden by its dash offset; toggling the
+   mic draws it across the icon and fades it out again in reverse. */
+.mic-indicator .mic-slash {
+  stroke-dasharray: 26;
+  stroke-dashoffset: 26;
+  transition: stroke-dashoffset 0.4s ease-in-out, opacity 0.4s ease-in-out;
+  color: var(--text-muted);
+}
+
+/* Mic off: greyed out and struck through. */
+
+.mic-indicator.off .mic-slash {
+  stroke-dashoffset: 0;
+  opacity: 1;
+}
+
+/* The preamp only applies to a live microphone, so it is inert while the mic
+   is off. */
+.preamp.disabled {
+  opacity: 0.3;
+  cursor: default;
+  pointer-events: none;
+}
+
+.preamp-track {
+  position: relative;
+  width: 8px;
+  height: 100%;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+  transition: background 0.12s ease;
+}
+
+.preamp-fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 40%;
+  border-radius: 999px;
+  background: linear-gradient(to top, rgba(255, 255, 255, 0.82), #ffffff);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
+  transition: height 0.12s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.preamp:hover .preamp-track { background: rgba(255, 255, 255, 0.11); }
+
+.preamp.is-dragging { cursor: ns-resize; }
+.preamp.is-dragging .preamp-fill { transition: none; }
+
+.preamp:focus-visible .preamp-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.preamp-readout {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: clamp(16px, var(--pos), calc(100% - 16px));
+  transform: translateY(-50%);
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: rgba(10, 11, 13, 0.92);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.preamp:hover .preamp-readout,
+.preamp:focus-visible .preamp-readout,
+.preamp.is-dragging .preamp-readout { opacity: 1; }
+
+.preamp-key {
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.preamp-db {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  white-space: nowrap;
+}
+
 /* ---------- Selectors ---------- */
+/* The generator list and its options sit directly in the sidebar — no card. */
 .selectors {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface-2);
   flex: none;
 }
 
@@ -190,43 +335,74 @@ body.pointer-idle #panel-open { opacity: 0; pointer-events: none; }
 }
 
 .model-gallery {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.model-tile {
   display: flex;
   flex-direction: column;
-  padding: 0;
+  gap: 6px;
+}
+
+/* One generator per row: cover icon and name. */
+.model-item {
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   background: var(--surface);
-  color: var(--text-muted);
-  cursor: pointer;
   overflow: hidden;
-  transition: border-color 0.12s ease, color 0.12s ease;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
-.model-tile:hover { border-color: var(--text-faint); }
+.model-item:hover { border-color: var(--text-faint); }
 
-.model-tile.selected {
-  border-color: var(--accent);
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px var(--accent);
+.model-item.selected {
+  border: 1px;
+  border-color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--text);
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+/*.model-row:hover { background: var(--surface-2); color: var(--text); } */
+.model-item.selected .model-row { color: var(--text); }
+
+.model-row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--text);
 }
 
 .model-thumb {
   position: relative;
-  aspect-ratio: 1 / 1;
+  flex: none;
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
   background: var(--surface-3);
   overflow: hidden;
 }
 
+/* Fallback glyph shows until the generated cover arrives. */
+.model-thumb .model-glyph,
 .model-thumb img {
-  display: block;
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
+}
+
+.model-thumb .model-glyph { padding: 7px; color: var(--text-faint); }
+
+.model-thumb img {
+  z-index: 1;
   object-fit: cover;
   opacity: 0;
   transition: opacity 0.35s ease;
@@ -237,27 +413,143 @@ body.pointer-idle #panel-open { opacity: 0; pointer-events: none; }
 .model-thumb.loading::after {
   content: '';
   position: absolute;
+  z-index: 2;
   inset: 0;
   margin: auto;
-  width: 16px;
-  height: 16px;
+  width: 12px;
+  height: 12px;
   border: 2px solid var(--line-strong);
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
 
-.model-tile .model-name {
-  padding: 6px 8px 7px;
+.model-name {
+  flex: 1 1 auto;
+  min-width: 0;
   font-family: var(--font-mono);
-  font-size: 10.5px;
-  text-align: left;
+  font-size: 11px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* Size picker: simply expands under the row. */
+.model-sizes {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.24s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.model-item.open .model-sizes { grid-template-rows: 1fr; }
+
+.model-sizes-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.model-sizes-panel {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 2px 9px 9px;
+}
+
+.size-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 6px 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 550;
+  line-height: 1.25;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+
+.size-option.inactive:hover:not(:disabled) {
+  border-color: var(--text-faint);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.size-option.active:hover:not(:disabled) {
+  border-color: var(--text);
+  background: rgba(255, 255, 255, 0.10);
+  color: var(--text);
+}
+
+
+.size-option.active {
+  border-color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+
+.size-option .size-meta {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+.size-option.active .size-meta { color: var(--text-muted); }
+
+/* Missing variant: still shown so the size axis reads consistently. */
+.size-option:disabled {
+  opacity: 0.3;
+  border-color: var(--line);
+  background: transparent;
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+/* Credit for the model author, shown under the size options while expanded. */
+.model-credit {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 2px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.credit-author { color: var(--text-muted); }
+
+.credit-link {
+  width: fit-content;
+  max-width: 100%;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-faint);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+  transition: color 0.12s ease;
+}
+
+.credit-link:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 @keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .model-sizes { transition: none; }
+  .preamp,
+  .mic-indicator,
+  .mic-indicator .mic-slash { transition: none; }
+}
 
 .selector-grid {
   display: grid;
@@ -315,8 +607,8 @@ body.pointer-idle #panel-open { opacity: 0; pointer-events: none; }
   inset: 0 auto 0 0;
   z-index: 0;
   width: calc(var(--load, 0) * 100%);
-  background: linear-gradient(90deg, rgba(233, 161, 59, 0.32), rgba(233, 161, 59, 0.14));
-  box-shadow: inset -2px 0 6px rgba(233, 161, 59, 0.40);
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.26), rgba(255, 255, 255, 0.10));
+  box-shadow: inset -2px 0 6px rgba(255, 255, 255, 0.28);
   transition: width 0.18s ease;
   pointer-events: none;
 }
@@ -328,7 +620,7 @@ body.pointer-idle #panel-open { opacity: 0; pointer-events: none; }
 
 .stat-status.indeterminate::before {
   width: 38%;
-  background: linear-gradient(90deg, transparent, rgba(233, 161, 59, 0.38), transparent);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.34), transparent);
   animation: status-sweep 1.1s ease-in-out infinite;
 }
 
@@ -428,7 +720,7 @@ select.stat-value option {
 .btn.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #171308;
+  color: var(--bg);
   font-weight: 650;
   justify-content: center;
 }
@@ -440,6 +732,11 @@ select.stat-value option {
   border-color: var(--accent-line);
 }
 .btn.primary.active svg { color: var(--accent); }
+
+/* Pause button swaps its icon between pause and resume. */
+#btn-pause .icon-play { display: none; }
+#btn-pause.active .icon-pause { display: none; }
+#btn-pause.active .icon-play { display: block; }
 
 /* ---------- Control tabs ---------- */
 .tabs {
@@ -471,8 +768,21 @@ select.stat-value option {
   border-color: var(--tab-color, var(--accent));
 }
 
-.tab-panel { display: none; }
-.tab-panel.active { display: block; }
+.tab-panels {
+  display: grid;
+}
+
+/* Panels stack in the same grid cell, hidden but still laid out, so the panel
+   (and the spectrum above it) keeps the height of the tallest tab. */
+.tab-panel {
+  grid-area: 1 / 1;
+  visibility: hidden;
+  pointer-events: none;
+}
+.tab-panel.active {
+  visibility: visible;
+  pointer-events: auto;
+}
 
 /* ---------- Sliders ---------- */
 .group-title {
@@ -683,8 +993,8 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   height: 100%;
   width: 0;
   border-radius: 2px;
-  background: linear-gradient(90deg, rgba(233, 161, 59, 0.95), rgba(233, 161, 59, 0.55));
-  box-shadow: inset -2px 0 6px rgba(233, 161, 59, 0.5);
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.45));
+  box-shadow: inset -2px 0 6px rgba(255, 255, 255, 0.35);
   transition: width 0.18s ease;
 }
 

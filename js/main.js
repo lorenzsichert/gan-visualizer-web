@@ -11,9 +11,10 @@ import { SETTINGS, get } from './settings.js';
 import { LSDLatent, randn } from './lsd.js';
 import { AudioPipeline } from './audio.js';
 import { SpectrumView, aWeightDb, REF_MAG } from './spectrum.js';
+import { PreampSlider } from './preamp.js';
 
-const FFT_SIZE = 2048;         // FFT points (power of two)
-const BINS = FFT_SIZE / 2 + 1; // spectrum bins (1025)
+const FFT_SIZE = 8192;         // FFT points (power of two)
+const BINS = FFT_SIZE / 2 + 1; // spectrum bins (4097)
 
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
@@ -38,6 +39,9 @@ let DIM = 512;
 let lookup = new Uint16Array(DIM);
 let a = randn(DIM);
 let smoothed = new Float32Array(BINS);
+// Instantaneous A-weighted spectrum (no temporal EMA) used by the panel
+// display, so the spectrum view follows the audio with no time smoothing.
+let instantSpectrum = new Float32Array(BINS);
 let prevSpectrum = new Float32Array(BINS);
 let spectrum = new Float32Array(BINS);
 let audioNoise = new Float32Array(DIM);
@@ -61,6 +65,7 @@ function initLatentState(dim) {
   for (let i = 0; i < dim; i++) lookup[i] = i % BINS;
   a = randn(dim);
   smoothed.fill(0);
+  instantSpectrum.fill(0);
   prevSpectrum.fill(0);
   pulseSpectrum.fill(0);
   lsd = new LSDLatent(dim, get('Truncation'), get('Motion Randomness'));
@@ -71,16 +76,31 @@ function initLatentState(dim) {
 // ---------------------------------------------------------------------------
 const audio = new AudioPipeline();
 const spectrumView = new SpectrumView(document.getElementById('spectrum'));
+
+// Preamp gain is not a tab slider: it lives as the vertical pill left of the
+// spectrum and writes straight into the shared setting read by the audio path.
+const preampSlider = new PreampSlider(document.getElementById('preamp'), {
+  min: SETTINGS['Preamp Gain'].min,
+  max: SETTINGS['Preamp Gain'].max,
+  step: SETTINGS['Preamp Gain'].step,
+  value: SETTINGS['Preamp Gain'].value,
+  onInput: (value) => { SETTINGS['Preamp Gain'].value = value; },
+});
+SETTINGS['Preamp Gain'].uiSync = () => preampSlider.setValue(SETTINGS['Preamp Gain'].value);
+
 let demo = false;
 
 // Pulse injection source: the first PULSE_DIM spectrum bins, filtered by the
 // blue pulse band in computeLatent (A-weighted, no display smoothing) and
 // smoothed by Pulse Smooth. buildPulseInjection adds it straight into the
 // latent z (see the main loop), not into W space.
-const PULSE_DIM = 512; // number of spectrum bins that drive the pulse
+const PULSE_DIM = 512; // first 512 FFT bins drive the pulse (~0–3 kHz at 48 kHz)
 let pulseSpectrum = new Float32Array(PULSE_DIM);
 // 0 = off, 1 = mirror (sharp tiles), 2 = mirror + blurred side tiles.
 let mirrorMode = 2;
+// When true, the visualizer stops asking for new frames and painting them;
+// the last frame stays on screen while audio/spectrum keep running.
+let paused = false;
 
 // A source's display filter for the spectrum view: its center frequency, band
 // width, and react amount (plus the react range so the bell can be normalized).
@@ -98,8 +118,10 @@ function genDemoSpectrum(t, out) {
   const beat1 = 0.5 + 0.5 * Math.sin(t * 2.1);
   const beat2 = 0.5 + 0.5 * Math.sin(t * 3.7);
   out.fill(0);
-  // Peak centers/widths are bin indices for the 2048-point FFT, chosen to sit
-  // at the same frequencies in Hz as the original 1024-point demo.
+  // Peak centers/widths are bin indices for the 8192-point FFT, chosen to sit
+  // at the same frequencies in Hz as the original 1024-point demo. Scaling by
+  // the FFT-size ratio keeps the demo signal identical at any resolution.
+  const scale = FFT_SIZE / 2048;
   const peaks = [
     { f: 32, amp: 0.9 * beat1, w: 12 },
     { f: 80, amp: 0.7 * beat1, w: 16 },
@@ -109,8 +131,10 @@ function genDemoSpectrum(t, out) {
     { f: 880, amp: 0.3 * (0.5 + 0.5 * Math.sin(t * 5)), w: 48 },
   ];
   for (const p of peaks) {
+    const center = p.f * scale;
+    const width = p.w * scale;
     for (let i = 0; i < BINS; i++) {
-      const d = (i - p.f) / p.w;
+      const d = (i - center) / width;
       out[i] += p.amp * Math.exp(-d * d * 0.5);
     }
   }
@@ -149,8 +173,11 @@ const HF_TREE = `https://huggingface.co/api/models/${HF_REPO}/tree/main`;
 const FALLBACK_MODELS = [
   'abstract_art.onnx',
   'abstract_photo.onnx',
+  'abstract_photo_medium.onnx',
   'abstract_photo_big.onnx',
   'flowers_big.onnx',
+  'visionary.onnx',
+  'wildlife_big.onnx',
 ];
 
 function hubUrl(name) {
@@ -230,44 +257,271 @@ function applyModel(url) {
   if (worker) restartWorker();
 }
 
-// Highlight the tile for the active model.
-function markSelectedModel() {
-  if (!elModelGallery) return;
-  for (const tile of elModelGallery.children) {
-    const on = tile.dataset.url === modelUrl;
-    tile.classList.toggle('selected', on);
-    tile.setAttribute('aria-checked', on ? 'true' : 'false');
+// Generator families (e.g. "abstract photo") and their size variants. Models
+// without a size suffix are the small variant; `_medium` / `_big` add the rest.
+const SIZE_ORDER = ['small', 'medium', 'big'];
+const SIZE_LABELS = { small: 'Small', medium: 'Medium', big: 'Big' };
+const SIZE_SUFFIX = /_(small|medium|big)$/i;
+
+// Model authorship, shown as credit under the size options of each expanded
+// generator. Keys are the family base names (filename without `.onnx`).
+const MODEL_CREDITS = {
+  abstract_art: {
+    author: 'Michael Friesen',
+    links: ['https://x.com/MichaelFriese10'],
+  },
+  abstract_photo: {
+    author: 'Michael Friesen',
+    links: ['https://x.com/MichaelFriese10'],
+  },
+  flowers: {
+    author: 'Justin Pinkney',
+    links: ['https://www.justinpinkney.com'],
+  },
+  visionary: {
+    author: 'Jeremy Torman',
+    links: ['https://x.com/TormanJeremy'],
+  },
+  wildlife: {
+    author: 'Michael Friesen',
+    links: ['https://x.com/MichaelFriese10'],
+  },
+};
+
+let modelFamilies = [];
+let modelFamilyByUrl = new Map();
+
+function groupModels(entries) {
+  const byBase = new Map();
+  for (const m of entries) {
+    const file = m.name.replace(/^.*\//, '').replace(/\.onnx$/i, '');
+    const match = file.match(SIZE_SUFFIX);
+    const base = (match ? file.slice(0, match.index) : file).replace(/_+$/, '');
+    const size = match ? match[1].toLowerCase() : 'small';
+    let family = byBase.get(base);
+    if (!family) {
+      family = { base, sizes: {} };
+      byBase.set(base, family);
+    }
+    family.sizes[size] = m;
+  }
+  return [...byBase.values()].sort((a, b) => a.base.localeCompare(b.base));
+}
+
+// The variant a family shows before the user picks one: prefer the smallest.
+function preferredUrl(family) {
+  for (const size of SIZE_ORDER) {
+    if (family.sizes[size]) return family.sizes[size].url;
+  }
+  return null;
+}
+
+function familyUrl(family) {
+  for (const size of SIZE_ORDER) {
+    if (family.sizes[size] && family.sizes[size].url === modelUrl) return modelUrl;
+  }
+  return preferredUrl(family);
+}
+
+function familyItem(family) {
+  if (!elModelGallery) return null;
+  for (const item of elModelGallery.children) {
+    if (item.dataset.base === family.base) return item;
+  }
+  return null;
+}
+
+function setFamilyExpanded(item, open) {
+  if (!item) return;
+  item.classList.toggle('open', open);
+  const row = item.querySelector('.model-row');
+  if (row) row.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+// The cover to show as the row icon: the active variant when selected, else the
+// family's preferred (smallest) variant.
+function iconUrlFor(family) {
+  if (modelUrl) {
+    for (const size of SIZE_ORDER) {
+      const m = family.sizes[size];
+      if (m && m.url === modelUrl) return modelUrl;
+    }
+  }
+  return preferredUrl(family);
+}
+
+function updateFamilyIcon(family, item) {
+  const url = iconUrlFor(family);
+  if (!url || item.dataset.iconUrl === url) return;
+  const thumb = item.querySelector('.model-thumb');
+  const img = item.querySelector('img');
+  if (!thumb || !img) return;
+
+  item.dataset.iconUrl = url;
+  const model = SIZE_ORDER.map((s) => family.sizes[s]).find((m) => m && m.url === url);
+  const cover = model ? loadCachedCover(model) : null;
+  if (cover) {
+    img.src = cover;
+    img.classList.add('ready');
+    thumb.classList.remove('loading');
+  } else {
+    img.removeAttribute('src');
+    img.classList.remove('ready');
+    thumb.classList.add('loading');
   }
 }
 
-// Build the model picker: one tile per discovered model, each with a
-// generated cover image (filled in asynchronously by generateCovers()).
+// Highlight the row for the active family, open it, and mark the active size.
+function markSelectedModel() {
+  if (!elModelGallery) return;
+  const active = modelUrl ? modelFamilyByUrl.get(modelUrl) : null;
+  for (const item of elModelGallery.children) {
+    const family = modelFamilies.find((f) => f.base === item.dataset.base);
+    if (!family) continue;
+    const on = family === active;
+    item.classList.toggle('selected', on);
+    setFamilyExpanded(item, on);
+    const row = item.querySelector('.model-row');
+    row.classList.toggle('selected', on);
+    row.setAttribute('aria-checked', on ? 'true' : 'false');
+    for (const option of item.querySelectorAll('.size-option')) {
+      const selected = option.dataset.url === modelUrl;
+      option.classList.toggle('active', selected);
+      option.classList.toggle('inactive', !selected);
+      option.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    }
+    updateFamilyIcon(family, item);
+  }
+}
+
+// One row per generator family (icon + name) that expands into a row of size
+// options. Missing sizes stay visible but disabled.
 function buildModelGallery() {
   if (!elModelGallery) return;
   elModelGallery.innerHTML = '';
-  for (const m of modelList) {
-    const tile = document.createElement('button');
-    tile.type = 'button';
-    tile.className = 'model-tile';
-    tile.dataset.url = m.url;
-    tile.setAttribute('role', 'radio');
-    tile.setAttribute('aria-checked', 'false');
-    tile.title = m.size ? `${m.name} (${(m.size / 1048576).toFixed(1)} MB)` : m.name;
+  modelFamilies = groupModels(modelList);
+  modelFamilyByUrl = new Map();
+  for (const family of modelFamilies) {
+    for (const size of SIZE_ORDER) {
+      if (family.sizes[size]) modelFamilyByUrl.set(family.sizes[size].url, family);
+    }
+  }
+
+  modelFamilies.forEach((family, index) => {
+    const item = document.createElement('div');
+    item.className = 'model-item';
+    item.dataset.base = family.base;
+
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'model-row';
+    row.setAttribute('role', 'radio');
+    row.setAttribute('aria-checked', 'false');
+    row.setAttribute('aria-expanded', 'false');
+    row.setAttribute('aria-controls', `model-sizes-${index}`);
 
     const thumb = document.createElement('span');
     thumb.className = 'model-thumb loading';
     const img = document.createElement('img');
     img.alt = '';
-    thumb.appendChild(img);
+    const glyph = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    glyph.setAttribute('class', 'model-glyph');
+    glyph.setAttribute('viewBox', '0 0 24 24');
+    glyph.setAttribute('fill', 'none');
+    glyph.setAttribute('stroke', 'currentColor');
+    glyph.setAttribute('stroke-width', '1.5');
+    glyph.setAttribute('stroke-linecap', 'round');
+    glyph.setAttribute('stroke-linejoin', 'round');
+    glyph.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', 'M3 17l5-6 4 4 3-4 6 7M3 7h18');
+    glyph.appendChild(path);
+    thumb.append(glyph, img);
 
     const name = document.createElement('span');
     name.className = 'model-name';
-    name.textContent = modelLabel(m.name);
+    name.textContent = modelLabel(family.base);
 
-    tile.append(thumb, name);
-    tile.addEventListener('click', () => applyModel(m.url));
-    elModelGallery.appendChild(tile);
-  }
+    row.append(thumb, name);
+
+    const sizes = document.createElement('div');
+    sizes.className = 'model-sizes';
+    sizes.id = `model-sizes-${index}`;
+    const inner = document.createElement('div');
+    inner.className = 'model-sizes-inner';
+    const panel = document.createElement('div');
+    panel.className = 'model-sizes-panel';
+
+    for (const size of SIZE_ORDER) {
+      const m = family.sizes[size];
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'size-option';
+      option.dataset.size = size;
+
+      const label = document.createElement('span');
+      label.className = 'size-label';
+      label.textContent = SIZE_LABELS[size];
+
+      const meta = document.createElement('span');
+      meta.className = 'size-meta';
+      meta.textContent = m && m.size ? `${Math.round(m.size / 1048576)} MB` : '\u2014';
+
+      option.append(label, meta);
+      if (m) {
+        option.dataset.url = m.url;
+        option.title = m.size ? `${m.name} (${(m.size / 1048576).toFixed(1)} MB)` : m.name;
+        option.addEventListener('click', () => {
+          setFamilyExpanded(item, true);
+          applyModel(m.url);
+        });
+      } else {
+        option.disabled = true;
+        option.setAttribute('aria-disabled', 'true');
+        option.title = `${SIZE_LABELS[size]} not available for ${modelLabel(family.base)}`;
+      }
+      panel.appendChild(option);
+    }
+
+    const credit = MODEL_CREDITS[family.base];
+    if (credit) {
+      const creditEl = document.createElement('div');
+      creditEl.className = 'model-credit';
+
+      const author = document.createElement('span');
+      author.className = 'credit-author';
+      author.textContent = `Author: ${credit.author}`;
+      creditEl.appendChild(author);
+
+      for (const href of credit.links) {
+        const link = document.createElement('a');
+        link.className = 'credit-link';
+        link.href = href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = href;
+        creditEl.appendChild(link);
+      }
+      panel.appendChild(creditEl);
+    }
+
+    inner.appendChild(panel);
+    sizes.appendChild(inner);
+    item.append(row, sizes);
+
+    row.addEventListener('click', () => {
+      if (item.classList.contains('selected')) {
+        setFamilyExpanded(item, !item.classList.contains('open'));
+        return;
+      }
+      const url = familyUrl(family);
+      if (url === modelUrl) markSelectedModel();
+      else applyModel(url);
+    });
+
+    elModelGallery.appendChild(item);
+  });
+
   markSelectedModel();
 }
 
@@ -325,23 +579,31 @@ const COVER_SEED = 0x5eed;
 
 let coverWorker = null;
 let coverBusy = false;
+let coverCurrent = null;
 let coversRequested = false;
 const coverQueue = [];
 const coverQueued = new Set();
+// Data URLs for covers already produced this session; localStorage is the
+// durable cache, this just avoids a storage read every time a row is repainted.
+const coverCache = new Map();
 
 function coverKey(m) {
   return `${COVER_PREFIX}${m.url}:${m.size || 0}`;
 }
 
 function loadCachedCover(m) {
+  if (coverCache.has(m.url)) return coverCache.get(m.url);
   try {
-    return localStorage.getItem(coverKey(m));
+    const dataUrl = localStorage.getItem(coverKey(m));
+    if (dataUrl) coverCache.set(m.url, dataUrl);
+    return dataUrl;
   } catch (err) {
     return null;
   }
 }
 
 function saveCachedCover(m, dataUrl) {
+  coverCache.set(m.url, dataUrl);
   try {
     localStorage.setItem(coverKey(m), dataUrl);
   } catch (err) {
@@ -349,24 +611,21 @@ function saveCachedCover(m, dataUrl) {
   }
 }
 
-function tileFor(url) {
-  if (!elModelGallery) return null;
-  for (const tile of elModelGallery.children) {
-    if (tile.dataset.url === url) return tile;
-  }
-  return null;
-}
-
 function setCover(url, dataUrl) {
-  const tile = tileFor(url);
-  if (!tile) return;
-  const img = tile.querySelector('img');
-  const thumb = tile.querySelector('.model-thumb');
+  const family = modelFamilyByUrl.get(url);
+  if (!family) return;
+  const item = familyItem(family);
+  if (!item) return;
+  // Only paint the row if this variant is the one its icon represents.
+  if (iconUrlFor(family) !== url) return;
+  const img = item.querySelector('img');
+  const thumb = item.querySelector('.model-thumb');
   if (img) {
     img.src = dataUrl;
     img.classList.add('ready');
   }
   if (thumb) thumb.classList.remove('loading');
+  item.dataset.iconUrl = url;
 }
 
 function rgbaToDataUrl(bytes, size) {
@@ -385,20 +644,56 @@ function ensureCoverWorker() {
   coverWorker.onmessage = (e) => onCoverMessage(e.data);
   coverWorker.onerror = () => {
     coverBusy = false;
+    coverCurrent = null;
     pumpCoverQueue();
   };
   return coverWorker;
 }
 
+// Cover generation is a full model inference per image, so it must not run while
+// the site is closed or in a background tab. A hidden tab also stops painting,
+// which means the generated images would never be seen; suspending the worker
+// saves the GPU/CPU work until the site is opened again.
+function suspendCoverWorker() {
+  if (coverWorker) {
+    coverWorker.terminate();
+    coverWorker = null;
+  }
+  if (coverBusy && coverCurrent) {
+    // The interrupted job will never post a result — requeue it at the front.
+    coverQueue.unshift(coverCurrent);
+  }
+  coverBusy = false;
+  coverCurrent = null;
+}
+
 function pumpCoverQueue() {
   if (coverBusy || !coverQueue.length) return;
+  if (document.visibilityState !== 'visible') return;
   coverBusy = true;
-  const m = coverQueue.shift();
-  ensureCoverWorker().postMessage({ type: 'cover', url: versionedUrl(m.url), seed: COVER_SEED });
+  coverCurrent = coverQueue.shift();
+  ensureCoverWorker().postMessage({
+    type: 'cover',
+    url: versionedUrl(coverCurrent.url),
+    seed: COVER_SEED,
+  });
 }
+
+// Resume rendering as soon as the site is visible again; stop right away when
+// it is hidden or closed.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') pumpCoverQueue();
+  else suspendCoverWorker();
+});
+
+// Cover bfcache / navigation as well: a page in the back-forward cache is not
+// open, so stop the worker and restart it if the page is restored.
+window.addEventListener('pagehide', suspendCoverWorker);
+window.addEventListener('pageshow', pumpCoverQueue);
 
 function onCoverMessage(msg) {
   coverBusy = false;
+  coverCurrent = null;
   // The worker echoes back the versioned URL it was given; resolve it to the
   // model's plain URL, which is what the tiles and cover cache are keyed by.
   const m =
@@ -407,10 +702,11 @@ function onCoverMessage(msg) {
   const key = m ? m.url : msg.url;
   coverQueued.delete(key);
   if (msg.error) {
-    const tile = tileFor(key);
-    if (tile) {
-      tile.classList.add('cover-failed');
-      const thumb = tile.querySelector('.model-thumb');
+    const family = modelFamilyByUrl.get(key);
+    const item = family ? familyItem(family) : null;
+    if (item && iconUrlFor(family) === key) {
+      item.classList.add('cover-failed');
+      const thumb = item.querySelector('.model-thumb');
       if (thumb) thumb.classList.remove('loading');
     }
   } else {
@@ -911,6 +1207,11 @@ const blurTile = document.createElement('canvas');
 const blurTileCtx = blurTile.getContext('2d');
 
 function renderResult(bytes, ms, dims) {
+  // Never paint while the site is hidden (background tab, minimized window or
+  // an OS/compositor that keeps the page "visible" while it is not on screen),
+  // or while the user has paused the visualizer. The worker is still acked
+  // below so its one in-flight frame completes.
+  if (document.visibilityState !== 'visible' || paused) return;
   // dims is [height, width] as reported by the worker.
   const rw = dims && dims[1] > 0 ? dims[1] : renderW;
   const rh = dims && dims[0] > 0 ? dims[0] : renderH;
@@ -1023,10 +1324,10 @@ function computeLatent(dt, nowSec) {
   }
 
   // --- A-weighting (perceptual loudness, same curve as the panel display) ---
-  // The preamped, A-weighted, smoothed spectrum is the shared signal consumed
-  // by the latent/LSD path and the panel display; brightness and pulse instead
-  // read the same weighting WITHOUT the display smoothing (below). Gain is
-  // cached per sample rate; bin i's frequency is i * sr / FFT_SIZE.
+  // The preamped, A-weighted spectrum is the shared signal consumed by the
+  // latent/LSD path and the panel display; brightness and pulse read the same
+  // weighting directly (without either the display or latent smoothing).
+  // Gain is cached per sample rate; bin i's frequency is i * sr / FFT_SIZE.
   const sr = audio.lastSampleRate || 48000;
   if (!aWeightGain || aWeightSR !== sr) {
     if (!aWeightGain) aWeightGain = new Float32Array(BINS);
@@ -1037,10 +1338,15 @@ function computeLatent(dt, nowSec) {
   }
 
   // --- Smoothing ---
+  // One A-weighted value per bin feeds both paths: `instantSpectrum` (no EMA)
+  // drives the panel display, while `smoothed` (the Smoothing Factor EMA)
+  // drives the latent/LSD modulation.
   const smoothingFactor = get('Smoothing Factor');
   const smoothing = 1 - Math.exp((-dt * 10) / Math.max(smoothingFactor, 1e-6));
   for (let i = 0; i < BINS; i++) {
-    smoothed[i] = smoothing * smoothed[i] + (1 - smoothing) * spectrum[i] * aWeightGain[i];
+    const v = spectrum[i] * aWeightGain[i];
+    instantSpectrum[i] = v;
+    smoothed[i] = smoothing * smoothed[i] + (1 - smoothing) * v;
   }
 
   // --- Randomize Latent Vector (swap two lookup entries periodically) ---
@@ -1160,12 +1466,33 @@ let inferSum = 0;
 let inferCount = 0;
 let thisHue = 0;
 
+// Keep the frame clock honest across a hide/show cycle so the first visible
+// frame does not report a bogus FPS or a huge dt.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    lastT = performance.now() / 1000;
+    fpsWindow = performance.now();
+    fpsFrames = 0;
+  }
+});
+
 function loop(now) {
+  // rAF normally pauses in a hidden tab, but some browsers/OS window managers
+  // keep running it for minimized or occluded windows. Stop all inference and
+  // painting explicitly until the site is visible again.
+  if (document.visibilityState !== 'visible') {
+    lastT = now / 1000;
+    fpsWindow = now;
+    fpsFrames = 0;
+    requestAnimationFrame(loop);
+    return;
+  }
+
   const nowSec = now / 1000;
   const dt = Math.min(Math.max(nowSec - lastT, 1e-4), 0.1);
   lastT = nowSec;
 
-  if (ready && lsd) {
+  if (!paused && ready && lsd) {
     const z = computeLatent(dt, nowSec);
     // Add the blue pulse filter's output to the latent (z) space. Tiled if the
     // latent is longer than the pulse vector.
@@ -1191,11 +1518,12 @@ function loop(now) {
     window.__dbg.pulseInj = +lastPulseMag.toFixed(4);
   }
 
-  // Panel spectrum display: the SAME A-weighted, smoothed spectrum that drives
-  // the latent/LSD path (see `computeLatent`), drawn raw — the view applies no
-  // weighting, blur, envelope or auto-gain of its own.
+  // Panel spectrum display: the A-weighted spectrum WITHOUT the Smoothing
+  // Factor EMA — only the worklet's short 2048-sample analysis window shapes
+  // it, so the trace follows transients immediately. The view adds spatial
+  // smoothing only.
   spectrumView.update(
-    smoothed,
+    instantSpectrum,
     audio.lastSampleRate || 48000,
     {
       pulse: filterInfo('Pulse Freq', 'Pulse Width', 'Pulse React'),
@@ -1226,15 +1554,15 @@ function loop(now) {
 // The panel settings split into tabs below the spectrum. Each tab button is
 // tinted with the same color as its draggable band filter on the spectrum
 // (pulse blue, brightness white, motion yellow); "General" has no spectrum band
-// so it keeps the amber signal accent. Every tab is built once (sliders stay in
+// so it keeps the neutral signal accent. Every tab is built once (sliders stay in
 // the DOM) and switching only toggles visibility, so external sync via
 // `syncSettingUI` keeps working regardless of which tab is showing.
 const TAB_KEY = 'control-tab';
 const CONTROL_TABS = [
-  { id: 'general', label: 'General', color: '#e9a13b', soft: 'rgba(233, 161, 59, 0.16)' },
+  { id: 'general', label: 'General', color: '#e8eaee', soft: 'rgba(255, 255, 255, 0.14)' },
   { id: 'motion', label: 'Motion', color: '#ffd966', soft: 'rgba(255, 217, 102, 0.16)' },
   { id: 'pulse', label: 'Pulse', color: '#53c1f1', soft: 'rgba(83, 193, 241, 0.16)' },
-  { id: 'brightness', label: 'Brightness', color: '#ffffff', soft: 'rgba(255, 255, 255, 0.14)' },
+  { id: 'brightness', label: 'Bright', color: '#ffffff', soft: 'rgba(255, 255, 255, 0.14)' },
 ];
 
 // Which spectrum filter handles blink when a tab is selected. General has no
@@ -1254,6 +1582,9 @@ function tabForSetting(name) {
   if (name.startsWith('Brightness ')) return 'brightness';
   return 'general';
 }
+
+// Set by buildSliders; lets spectrum interactions bring up their tab.
+let activateTab = null;
 
 function buildSliderRow(name, def) {
   const row = document.createElement('div');
@@ -1312,6 +1643,8 @@ function buildSliders() {
       btn.setAttribute('aria-selected', on ? 'true' : 'false');
     }
     for (const [tid, pane] of panes) pane.classList.toggle('active', tid === id);
+    // Draw that band's filtered spectrum in its color on the spectrum view.
+    spectrumView.setActiveFilter(id === 'general' ? null : id);
     try {
       localStorage.setItem(TAB_KEY, id);
     } catch (err) {
@@ -1319,6 +1652,7 @@ function buildSliders() {
     }
     if (blink) spectrumView.flash(TAB_FILTERS[id] || []);
   };
+  activateTab = activate;
 
   for (const tab of CONTROL_TABS) {
     const btn = document.createElement('button');
@@ -1338,7 +1672,7 @@ function buildSliders() {
     pane.setAttribute('role', 'tabpanel');
     pane.dataset.tab = tab.id;
     for (const [name, def] of Object.entries(SETTINGS)) {
-      if (def.hidden || tabForSetting(name) !== tab.id) continue;
+      if (def.hidden || def.detached || tabForSetting(name) !== tab.id) continue;
       pane.appendChild(buildSliderRow(name, def));
     }
     panes.set(tab.id, pane);
@@ -1365,7 +1699,9 @@ window.addEventListener('resize', resize);
 // Push an externally-changed setting into its slider UI (if visible).
 function syncSettingUI(name) {
   const def = SETTINGS[name];
-  if (!def || !def.uiInput) return;
+  if (!def) return;
+  if (def.uiSync) def.uiSync();
+  if (!def.uiInput) return;
   def.uiInput.value = def.value;
   def.uiVal();
 }
@@ -1381,6 +1717,10 @@ function setupUI() {
     pulse: { freq: 'Pulse Freq', width: 'Pulse Width', react: 'Pulse React' },
     brightness: { freq: 'Brightness Freq', width: 'Brightness Width', react: 'Brightness React' },
     motion: { freq: 'Motion Freq', width: 'Motion Width', react: 'Motion React' },
+  };
+  spectrumView.onFilterSelect = (id) => {
+    // Grabbing a band handle on the spectrum brings up that band's controls.
+    if (CONTROL_TABS.some((tab) => tab.id === id)) activateTab?.(id, false);
   };
   spectrumView.onFilterChange = (id, freq, width, react) => {
     const keys = FILTER_KEYS[id] || FILTER_KEYS.brightness;
@@ -1456,20 +1796,41 @@ function setupUI() {
   markPointerActive();
 
   const btnMic = document.getElementById('btn-mic');
+  const micIndicator = document.getElementById('mic-indicator');
+
+  function updateAudioStatus() {
+    if (audio.active) {
+      elAudio.textContent = 'on';
+      elAudio.classList.add('on');
+    } else if (demo) {
+      elAudio.textContent = 'demo';
+      elAudio.classList.add('on');
+    } else {
+      elAudio.textContent = 'off';
+      elAudio.classList.remove('on');
+    }
+  }
+
+  function setMicUI(active) {
+    btnMic.querySelector('.btn-label').textContent = active
+      ? 'Microphone: ON'
+      : 'Enable Microphone';
+    btnMic.classList.toggle('active', active);
+    micIndicator.classList.toggle('off', !active);
+    micIndicator.setAttribute('aria-label', active ? 'Microphone on' : 'Microphone off');
+    micIndicator.title = active ? 'Microphone on' : 'Microphone off';
+    preampSlider.setEnabled(active);
+    updateAudioStatus();
+  }
+
   btnMic.addEventListener('click', async () => {
     if (audio.active) {
       await audio.stop();
-      btnMic.querySelector('.btn-label').textContent = 'Enable Microphone';
-      btnMic.classList.remove('active');
-      elAudio.textContent = 'off';
-      elAudio.classList.remove('on');
+      setMicUI(false);
     } else {
       try {
         await audio.start();
-        btnMic.querySelector('.btn-label').textContent = 'Microphone: ON';
-        btnMic.classList.add('active');
-        elAudio.textContent = 'on';
-        elAudio.classList.add('on');
+        setMicUI(true);
       } catch (err) {
         setStatus('microphone unavailable');
       }
@@ -1480,14 +1841,27 @@ function setupUI() {
   btnDemo.addEventListener('click', () => {
     demo = !demo;
     btnDemo.classList.toggle('active', demo);
-    if (demo && !audio.active) {
-      elAudio.textContent = 'demo';
-      elAudio.classList.add('on');
-    } else {
-      elAudio.textContent = audio.active ? 'on' : 'off';
-      if (!audio.active) elAudio.classList.remove('on');
-    }
+    updateAudioStatus();
   });
+
+  const btnPause = document.getElementById('btn-pause');
+  const pauseLabel = btnPause.querySelector('span');
+  function updatePauseUI() {
+    btnPause.classList.toggle('active', paused);
+    btnPause.setAttribute('aria-pressed', paused ? 'true' : 'false');
+    pauseLabel.textContent = paused ? 'Resume' : 'Pause';
+    btnPause.title = paused
+      ? 'Resume the visualizer'
+      : 'Pause the visualizer; audio keeps running';
+  }
+  btnPause.addEventListener('click', () => {
+    paused = !paused;
+    updatePauseUI();
+  });
+  updatePauseUI();
+
+  // Mic starts off: the indicator is struck through and the preamp is inert.
+  setMicUI(false);
 
   document.getElementById('btn-fullscreen').addEventListener('click', () => {
     if (document.fullscreenElement) document.exitFullscreen();

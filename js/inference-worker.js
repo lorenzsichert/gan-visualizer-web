@@ -398,28 +398,55 @@ async function pump() {
  * red rolls horizontally, green vertically, blue stays. Operates on the RGBA
  * byte buffer (layout-independent), on the worker so the main thread only
  * blits.
+ *
+ * Both rolls are O(W*H) and run once per frame. The green (vertical) roll is
+ * done through a contiguous green plane: walking columns directly over the
+ * interleaved RGBA buffer is ~4x slower at 1024x1024 because every read and
+ * write jumps a whole row. The scratch buffers are reused (no per-frame
+ * allocation) and only grow when a larger model is loaded.
  */
 let rowTmp = new Uint8Array(512);
-let colTmp = new Uint8Array(512);
+let greenPlane = new Uint8Array(512 * 512);
+let greenRotated = new Uint8Array(512 * 512);
 
 function hueShiftBytes(bytes, shift, WW, HH) {
-  // Grow the scratch rows/cols for model resolutions above 512.
+  const sx = ((shift % WW) + WW) % WW;
+  const sy = ((shift % HH) + HH) % HH;
+  const stride = WW * 4;
+
+  // Red: roll each row horizontally (contiguous within the row).
   if (rowTmp.length < WW) rowTmp = new Uint8Array(WW);
-  if (colTmp.length < HH) colTmp = new Uint8Array(HH);
   for (let y = 0; y < HH; y++) {
-    const row = y * WW * 4;
+    const row = y * stride;
     for (let x = 0; x < WW; x++) rowTmp[x] = bytes[row + x * 4];
     for (let x = 0; x < WW; x++) {
-      const nx = ((x - shift) % WW + WW) % WW;
+      let nx = x - sx;
+      if (nx < 0) nx += WW;
       bytes[row + x * 4] = rowTmp[nx];
     }
   }
-  for (let x = 0; x < WW; x++) {
-    for (let y = 0; y < HH; y++) colTmp[y] = bytes[y * WW * 4 + x * 4 + 1];
-    for (let y = 0; y < HH; y++) {
-      const ny = ((y - shift) % HH + HH) % HH;
-      bytes[y * WW * 4 + x * 4 + 1] = colTmp[ny];
-    }
+
+  // Green: roll vertically. Extract the channel, rotate whole rows in a second
+  // dense plane, then scatter it back.
+  const planeLen = WW * HH;
+  if (greenPlane.length < planeLen) {
+    greenPlane = new Uint8Array(planeLen);
+    greenRotated = new Uint8Array(planeLen);
+  }
+  for (let y = 0; y < HH; y++) {
+    const row = y * stride;
+    const dst = y * WW;
+    for (let x = 0; x < WW; x++) greenPlane[dst + x] = bytes[row + x * 4 + 1];
+  }
+  for (let y = 0; y < HH; y++) {
+    let ny = y - sy;
+    if (ny < 0) ny += HH;
+    greenRotated.set(greenPlane.subarray(ny * WW, ny * WW + WW), y * WW);
+  }
+  for (let y = 0; y < HH; y++) {
+    const row = y * stride;
+    const src = y * WW;
+    for (let x = 0; x < WW; x++) bytes[row + x * 4 + 1] = greenRotated[src + x];
   }
 }
 

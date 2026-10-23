@@ -118,6 +118,13 @@ scripts/bench-ort.mjs      node script: times a single WASM inference of the ONN
 without a CDN. To upgrade onnxruntime-web, bump the version in
 `scripts/fetch-ort.mjs` and re-run it.
 
+## Analytics
+
+`index.html` includes Vercel Web Analytics (anonymous page views and visitors).
+Enable it once in the Vercel dashboard under **Project → Analytics → Enable**,
+then redeploy. On the Hobby plan the free allowance is 50,000 events/month and
+custom events (e.g. per-model tracking) require Pro.
+
 ## Notes
 
 - Best performance in **Chrome / Edge / Firefox** with cross-origin isolation

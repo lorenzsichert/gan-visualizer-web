@@ -1,7 +1,2 @@
-models/abstract_art_EndToEndNetwork.onnx filter=lfs diff=lfs merge=lfs -text
-models/abstract_photo_big_EndToEndNetwork.onnx filter=lfs diff=lfs merge=lfs -text
-models/abstract_photo_EndToEndNetwork.onnx filter=lfs diff=lfs merge=lfs -text
-models/flowers_big_EndToEndNetwork.onnx filter=lfs diff=lfs merge=lfs -text
-*.psd filter=lfs diff=lfs merge=lfs -text
-models/*.onnx filter=lfs diff=lfs merge=lfs -text
-*.onnx filter=lfs diff=lfs merge=lfs -text
+# Git LFS is no longer used in this repository. Large model files are hosted on
+# Hugging Face and downloaded at runtime instead of being stored in Git.

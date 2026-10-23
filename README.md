@@ -113,6 +113,8 @@ scripts/latency-test.mjs   node script: measures the audio -> GAN-input DSP late
 scripts/bench-ort.mjs      node script: times a single WASM inference of the ONNX model
 ```
 
+Model distilled using this technique: https://arxiv.org/abs/2104.04767
+
 `npm run deps` is an idempotent helper that re-copies the wasm runtime from
 `node_modules` into `lib/ort-wasm/`; the checked-in copies mean the app runs
 without a CDN. To upgrade onnxruntime-web, bump the version in
